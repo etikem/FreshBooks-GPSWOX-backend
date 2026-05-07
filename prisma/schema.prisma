@@ -1,0 +1,262 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Tenant (single-tenant for now, but the model leaves room
+//  for multi-tenant later — every Client/Event references one)
+// ─────────────────────────────────────────────────────────────
+model Tenant {
+  id              String   @id @default(cuid())
+  name            String
+  freshbooksAccountId String
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  clients         Client[]
+  webhookEvents   WebhookEvent[]
+  syncRuns        SyncRun[]
+
+  @@map("tenants")
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Client — links a FreshBooks customer to a GPSWOX user
+// ─────────────────────────────────────────────────────────────
+enum ClientStatus {
+  ACTIVE       // GPSWOX access enabled
+  BLOCKED      // GPSWOX access disabled (outstanding balance > 0)
+  CANCELLED    // contract ended
+  UNKNOWN      // never synced yet
+}
+
+model Client {
+  id                  String   @id @default(cuid())
+  tenantId            String
+  tenant              Tenant   @relation(fields: [tenantId], references: [id])
+
+  email               String
+  name                String?
+  freshbooksClientId  String
+  gpswoxUserId        String?
+
+  contractStartDate   DateTime
+  contractEndDate     DateTime
+  // Latest date the client has paid through, derived from invoices.
+  paidThroughDate     DateTime?
+  // Latest date GPSWOX is set to expire (mirror of what we pushed to GPSWOX).
+  accessExpiresAt     DateTime?
+
+  status              ClientStatus @default(UNKNOWN)
+  // Last computed outstanding balance, stored as numeric for safety.
+  lastOutstanding     Decimal?     @db.Decimal(14, 2)
+  lastSyncedAt        DateTime?
+
+  createdAt           DateTime     @default(now())
+  updatedAt           DateTime     @updatedAt
+
+  invoices            InvoiceCache[]
+  paymentLogs         PaymentLog[]
+  actionLogs          ActionLog[]
+  retryJobs           RetryJob[]
+  syncRuns            SyncRun[]
+
+  @@unique([tenantId, freshbooksClientId])
+  @@index([email])
+  @@index([status])
+  @@map("clients")
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Webhook event — raw + idempotency
+// ─────────────────────────────────────────────────────────────
+model WebhookEvent {
+  id          String   @id @default(cuid())
+  tenantId    String?
+  tenant      Tenant?  @relation(fields: [tenantId], references: [id])
+
+  // External event id from FreshBooks (used for idempotency).
+  // We dedupe on (source, eventId).
+  source      String   // "freshbooks"
+  eventId     String
+  eventType   String   // e.g. "payment.create"
+  rawPayload  Json
+  signature   String?  // HMAC header captured for forensics
+
+  receivedAt  DateTime @default(now())
+  processedAt DateTime?
+  processed   Boolean  @default(false)
+  failed      Boolean  @default(false)
+  failureReason String?
+
+  // Cross-link to the SyncRun that processed this event.
+  syncRunId   String?
+  syncRun     SyncRun? @relation(fields: [syncRunId], references: [id])
+
+  @@unique([source, eventId])
+  @@index([processed, receivedAt])
+  @@map("webhook_events")
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Invoice cache — snapshot of the latest pull from FreshBooks
+//  (truth always lives in FreshBooks; this is for the UI only)
+// ─────────────────────────────────────────────────────────────
+model InvoiceCache {
+  id                   String   @id @default(cuid())
+  clientId             String
+  client               Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  freshbooksInvoiceId  String
+  invoiceNumber        String?
+  amount               Decimal  @db.Decimal(14, 2)
+  paid                 Decimal  @db.Decimal(14, 2)
+  balance              Decimal  @db.Decimal(14, 2)
+  currency             String
+  status               String   // raw FreshBooks status
+  issuedDate           DateTime?
+  dueDate              DateTime?
+
+  fetchedAt            DateTime @default(now())
+
+  @@unique([clientId, freshbooksInvoiceId])
+  @@index([clientId, dueDate])
+  @@map("invoice_cache")
+}
+
+// ─────────────────────────────────────────────────────────────
+//  PaymentLog — every payment event we observed
+// ─────────────────────────────────────────────────────────────
+model PaymentLog {
+  id                   String   @id @default(cuid())
+  clientId             String
+  client               Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  freshbooksPaymentId  String?
+  invoiceId            String?
+  amount               Decimal  @db.Decimal(14, 2)
+  currency             String
+  paidAt               DateTime?
+  source               String   // "webhook" | "manual" | "sync"
+  rawPayload           Json?
+
+  createdAt            DateTime @default(now())
+
+  @@index([clientId, paidAt])
+  @@map("payment_logs")
+}
+
+// ─────────────────────────────────────────────────────────────
+//  ActionLog — every decision/action we took (audit trail)
+// ─────────────────────────────────────────────────────────────
+enum ActionKind {
+  DECISION_BLOCK
+  DECISION_RESTORE
+  GPSWOX_ENABLE
+  GPSWOX_DISABLE
+  GPSWOX_UPDATE_EXPIRATION
+  ERROR
+  MANUAL_SYNC
+}
+
+model ActionLog {
+  id          String     @id @default(cuid())
+  clientId    String?
+  client      Client?    @relation(fields: [clientId], references: [id], onDelete: SetNull)
+
+  kind        ActionKind
+  message     String
+  details     Json?
+  // Hash of (clientId + kind + canonical-details) used for idempotency
+  // when retrying the same outbound GPSWOX call.
+  idempotencyKey String?
+
+  createdAt   DateTime   @default(now())
+
+  @@unique([idempotencyKey])
+  @@index([clientId, createdAt])
+  @@index([kind, createdAt])
+  @@map("action_logs")
+}
+
+// ─────────────────────────────────────────────────────────────
+//  RetryJob — failed outbound calls, retried with backoff
+// ─────────────────────────────────────────────────────────────
+enum RetryStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED      // exhausted attempts
+  CANCELLED   // operator cancelled
+}
+
+model RetryJob {
+  id            String      @id @default(cuid())
+  clientId      String
+  client        Client      @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  // Operation to retry. The handler dispatches on this.
+  operation     String      // e.g. "gpswox.enable", "gpswox.disable", "gpswox.updateExpiration"
+  payload       Json
+  // Stable idempotency key so the eventual call is safe even if we
+  // fired a stale duplicate from another path.
+  idempotencyKey String
+
+  status        RetryStatus @default(PENDING)
+  attempts      Int         @default(0)
+  maxAttempts   Int         @default(8)
+  nextAttemptAt DateTime    @default(now())
+  lastError     String?
+
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+  succeededAt   DateTime?
+
+  @@index([status, nextAttemptAt])
+  @@index([clientId, status])
+  @@map("retry_jobs")
+}
+
+// ─────────────────────────────────────────────────────────────
+//  SyncRun — one end-to-end evaluation for a client
+// ─────────────────────────────────────────────────────────────
+enum SyncTrigger {
+  WEBHOOK
+  MANUAL
+  CRON
+  RETRY
+}
+
+enum SyncOutcome {
+  RESTORED
+  BLOCKED
+  NO_CHANGE
+  ERROR
+}
+
+model SyncRun {
+  id              String      @id @default(cuid())
+  tenantId        String
+  tenant          Tenant      @relation(fields: [tenantId], references: [id])
+  clientId        String?
+  client          Client?     @relation(fields: [clientId], references: [id], onDelete: SetNull)
+
+  trigger         SyncTrigger
+  outcome         SyncOutcome?
+  outstanding     Decimal?    @db.Decimal(14, 2)
+  paidThroughDate DateTime?
+  notes           String?
+
+  startedAt       DateTime    @default(now())
+  finishedAt      DateTime?
+
+  events          WebhookEvent[]
+
+  @@index([clientId, startedAt])
+  @@index([outcome, startedAt])
+  @@map("sync_runs")
+}
