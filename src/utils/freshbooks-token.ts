@@ -7,10 +7,10 @@ import { logger } from './logger';
  * so the operator isn't chasing 20-second timeouts and 401s.
  */
 function readJwtExp(token: string): number | null {
-  const parts = token.split('.');
-  if (parts.length < 2) return null;
+  const payloadSegment = token.split('.')[1];
+  if (!payloadSegment) return null;
   try {
-    const padded = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const padded = payloadSegment.replace(/-/g, '+').replace(/_/g, '/');
     const json = Buffer.from(padded, 'base64').toString('utf8');
     const payload = JSON.parse(json) as { exp?: number };
     return typeof payload.exp === 'number' ? payload.exp : null;
