@@ -451,7 +451,6 @@ async function refreshInvoiceCache(
   clientId: string,
   invoices: Awaited<ReturnType<typeof freshbooksService.listInvoicesForClient>>,
 ): Promise<void> {
-  console.log("invoices====>", invoices)
   for (const inv of invoices) {
     await prisma.invoiceCache.upsert({
       where: {

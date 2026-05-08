@@ -21,9 +21,9 @@ const schema = z.object({
   GPSWOX_API_BASE: z.string().url(),
   GPSWOX_USER_API_HASH: z.string().min(1),
   GPSWOX_LOGIN_PATH: z.string().min(1).default('/api/login'),
-  GPSWOX_ENDPOINT_UPDATE_USER: z.string().min(1),
-  GPSWOX_ENDPOINT_ENABLE_DEVICES: z.string().min(1),
-  GPSWOX_ENDPOINT_DISABLE_DEVICES: z.string().min(1),
+  GPSWOX_ENDPOINT_CLIENT_UPDATE: z.string().min(1).default('/api/admin/client'),
+  GPSWOX_ENDPOINT_CLIENT_STATUS: z.string().min(1).default('/api/admin/client/status'),
+  GPSWOX_LANG: z.string().min(1).default('en'),
   GPSWOX_HTTP_TIMEOUT_MS: z.coerce.number().int().positive().default(15000),
 
   JWT_SECRET: z.string().min(16),
