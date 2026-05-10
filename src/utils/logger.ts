@@ -3,7 +3,7 @@ import { env } from '../config/env';
 
 export const logger = pino({
   level: env.LOG_LEVEL,
-  base: { service: 'freshbooks-gpswox' },
+  base: { service: 'freshbooks-abctrack' },
   redact: {
     paths: [
       'req.headers.authorization',
@@ -12,7 +12,13 @@ export const logger = pino({
       '*.token',
       '*.password',
       'env.FRESHBOOKS_API_TOKEN',
-      'env.GPSWOX_USER_API_HASH',
+      'env.FRESHBOOKS_API_REFRESH_TOKEN',
+      'env.FRESHBOOKS_CLIENT_SECRET',
+      '*.access_token',
+      '*.refresh_token',
+      '*.accessToken',
+      '*.refreshToken',
+      'env.ABCTRACK_PASSWORD',
       'env.JWT_SECRET',
       'env.ADMIN_PASSWORD_HASH',
     ],

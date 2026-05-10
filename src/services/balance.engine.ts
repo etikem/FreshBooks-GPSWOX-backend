@@ -1,5 +1,6 @@
 import Decimal from 'decimal.js';
 import { ZERO, isZero, isPositive, sum, format, toMoney } from '../utils/decimal';
+import { nextTenthAtEightUtc } from '../utils/expiration';
 import type { FreshbooksInvoice, BalanceDecision } from '../types';
 
 /**
@@ -143,7 +144,7 @@ export interface AccessDecisionInput extends BalanceEngineInput {
 }
 
 export interface AccessDecision extends BalanceDecision {
-  // The effective expiration we will push to GPSWOX (capped at contractEndDate).
+  // The effective expiration we will push to ABC Track (capped at contractEndDate).
   effectiveAccessExpiresAt: Date | null;
 }
 
@@ -165,10 +166,13 @@ export function decideAccess(input: AccessDecisionInput): AccessDecision {
     };
   }
 
-  // Cap access at contract end — never extend past it.
+  // Snap the paid-through date forward to the next 10th-of-month at
+  // 08:00 UTC — this is the ABC Track expiration we actually push, per the
+  // business rule. Then cap at contract end so we never extend past it.
   const cap = input.contractEndDate;
+  const snapped = nextTenthAtEightUtc(paidThrough);
   const effective =
-    paidThrough.getTime() > cap.getTime() ? cap : paidThrough;
+    snapped.getTime() > cap.getTime() ? cap : snapped;
 
   return {
     ...balance,

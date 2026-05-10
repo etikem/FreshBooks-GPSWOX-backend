@@ -1,14 +1,17 @@
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
 import { pollAndRunOnce } from '../services/retry.service';
+import { runCronSweepOnce } from '../services/cron-sweep.service';
+import { runNotificationCleanupOnce } from '../services/notification-cleanup.service';
 import { prisma } from '../db/prisma';
 
 let stopping = false;
+let lastCronSweepAt = 0;
+let lastCleanupAt = 0;
 
-// Recognises transient pool/socket errors that are recovered by reconnecting.
-// Seen in the wild: machine sleep, Postgres restart, NAT idle timeout.
-// Prisma's Rust engine surfaces these with varied wording, so we match a
-// broad set of substrings rather than relying on error codes.
+// Recognises transient pool/socket errors that recover after reconnecting.
+// Seen in the wild: machine sleep, Postgres restart, NAT idle timeout, and
+// Prisma's initial-connect failure (P1001) when Postgres is briefly down.
 function isConnectionError(err: unknown): boolean {
   const msg = (err as Error)?.message ?? '';
   return (
@@ -20,7 +23,10 @@ function isConnectionError(err: unknown): boolean {
     msg.includes('kind: Io') ||
     msg.includes('Closed') ||
     msg.includes('connection closed') ||
-    msg.includes('P1017') // Prisma "Server has closed the connection."
+    msg.includes("Can't reach database server") ||
+    msg.includes('P1001') ||
+    msg.includes('P1002') ||
+    msg.includes('P1017')
   );
 }
 
@@ -32,7 +38,6 @@ async function loop(): Promise<void> {
     } catch (err) {
       logger.error({ err: (err as Error).message }, 'retry.loop.error');
       if (isConnectionError(err)) {
-        // Drop the stale pool; the next iteration's query will auto-reconnect.
         try {
           await prisma.$disconnect();
           logger.warn('retry.db.reconnect');
@@ -44,6 +49,26 @@ async function loop(): Promise<void> {
         }
       }
     }
+
+    // Cron sweep — runs at most once per CRON_SWEEP_INTERVAL_MS. Keeps
+    // expired-access clients from drifting between webhooks.
+    const now = Date.now();
+    if (now - lastCronSweepAt >= env.CRON_SWEEP_INTERVAL_MS) {
+      lastCronSweepAt = now;
+      runCronSweepOnce().catch((err) =>
+        logger.warn({ err: (err as Error).message }, 'cron.sweep.failed'),
+      );
+    }
+
+    // Notification / webhook-event cleanup. Cheap delete-where; runs daily
+    // by default. Failures are non-fatal — table size grows for a day.
+    if (now - lastCleanupAt >= env.NOTIFICATION_CLEANUP_INTERVAL_MS) {
+      lastCleanupAt = now;
+      runNotificationCleanupOnce().catch((err) =>
+        logger.warn({ err: (err as Error).message }, 'notification.cleanup.failed'),
+      );
+    }
+
     await sleep(env.RETRY_POLL_INTERVAL_MS);
   }
 }
@@ -62,12 +87,13 @@ async function shutdown(signal: string): Promise<void> {
 process.on('SIGTERM', () => void shutdown('SIGTERM'));
 process.on('SIGINT', () => void shutdown('SIGINT'));
 
-// Connect once at boot so misconfigured DATABASE_URLs fail loud right away
-// instead of looking like an idle drop on the first poll.
 prisma
   .$connect()
   .then(() => {
-    logger.info('retry.worker.started');
+    logger.info(
+      { cronSweepIntervalMs: env.CRON_SWEEP_INTERVAL_MS },
+      'retry.worker.started',
+    );
     return loop();
   })
   .catch((err) => {

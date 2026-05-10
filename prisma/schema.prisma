@@ -25,13 +25,14 @@ model Tenant {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Client — links a FreshBooks customer to a GPSWOX user
+//  Client — links a FreshBooks customer to an ABC Track user
 // ─────────────────────────────────────────────────────────────
 enum ClientStatus {
-  ACTIVE       // GPSWOX access enabled
-  BLOCKED      // GPSWOX access disabled (outstanding balance > 0)
-  CANCELLED    // contract ended
-  UNKNOWN      // never synced yet
+  ACTIVE                    // ABC Track access enabled
+  BLOCKED                   // ABC Track access disabled (outstanding balance > 0)
+  CANCELLED                 // contract ended
+  UNKNOWN                   // never synced yet
+  NO_MATCHING_GPSWOX_USER   // FreshBooks client exists but no ABC Track user shares the email (enum value retained for migration compatibility)
 }
 
 model Client {
@@ -41,6 +42,26 @@ model Client {
 
   email               String
   name                String?
+  // Detailed profile pulled from FreshBooks /users/clients/<id> on the
+  // client.create webhook. All optional — clients in the wild often have
+  // sparse FreshBooks profiles.
+  firstName           String?
+  lastName            String?
+  organization        String?
+  businessPhone       String?
+  mobilePhone         String?
+  homePhone           String?
+  addressStreet       String?
+  addressStreet2      String?
+  addressCity         String?
+  addressProvince     String?
+  addressCountry      String?
+  addressCode         String?
+  currencyCode        String?
+  language            String?
+  vatName             String?
+  vatNumber           String?
+  notes               String?
   freshbooksClientId  String
   gpswoxUserId        String?
 
@@ -48,7 +69,7 @@ model Client {
   contractEndDate     DateTime
   // Latest date the client has paid through, derived from invoices.
   paidThroughDate     DateTime?
-  // Latest date GPSWOX is set to expire (mirror of what we pushed to GPSWOX).
+  // Latest date ABC Track is set to expire (mirror of what we pushed to ABC Track).
   accessExpiresAt     DateTime?
 
   status              ClientStatus @default(UNKNOWN)
@@ -121,10 +142,19 @@ model InvoiceCache {
   issuedDate           DateTime?
   dueDate              DateTime?
 
+  // Soft-delete fields. When FreshBooks no longer returns an invoice we
+  // previously cached (deleted/voided), we flip active=false rather than
+  // dropping the row, so the operator can still see the historical record.
+  // The decision pipeline never reads from the cache (truth lives in
+  // FreshBooks), so this is purely a UI/audit affordance.
+  active               Boolean  @default(true)
+  voidedAt             DateTime?
+
   fetchedAt            DateTime @default(now())
 
   @@unique([clientId, freshbooksInvoiceId])
   @@index([clientId, dueDate])
+  @@index([clientId, active])
   @@map("invoice_cache")
 }
 
@@ -159,6 +189,7 @@ enum ActionKind {
   GPSWOX_ENABLE
   GPSWOX_DISABLE
   GPSWOX_UPDATE_EXPIRATION
+  GPSWOX_MATCHED
   ERROR
   MANUAL_SYNC
 }
@@ -172,7 +203,7 @@ model ActionLog {
   message     String
   details     Json?
   // Hash of (clientId + kind + canonical-details) used for idempotency
-  // when retrying the same outbound GPSWOX call.
+  // when retrying the same outbound ABC Track call.
   idempotencyKey String?
 
   createdAt   DateTime   @default(now())
@@ -236,6 +267,30 @@ enum SyncOutcome {
   BLOCKED
   NO_CHANGE
   ERROR
+}
+
+// ─────────────────────────────────────────────────────────────
+//  OauthToken — durable storage for rotating OAuth credentials.
+//  Single row per `provider`. Updated on every refresh.
+//  Read+written by every node in a multi-node deployment, so
+//  refreshes are coordinated via a Postgres advisory lock keyed
+//  on the same `provider` string. See utils/pg-lock.ts.
+// ─────────────────────────────────────────────────────────────
+model OauthToken {
+  provider     String    @id                                      // "freshbooks"
+  accessToken  String    @map("access_token")
+  refreshToken String    @map("refresh_token")
+  // Wall-clock expiry computed from the `expires_in` we got back.
+  // Used for proactive refresh; nullable because not every flow
+  // returns it (and we still rely on 401 as the source of truth).
+  expiresAt    DateTime? @map("expires_at") @db.Timestamptz(3)
+  // Bumped on every successful refresh. Used by the advisory-lock
+  // pattern to detect "another node already refreshed while we
+  // were waiting for the lock".
+  updatedAt    DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@map("oauth_tokens")
 }
 
 model SyncRun {

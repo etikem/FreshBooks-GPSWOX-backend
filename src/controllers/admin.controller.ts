@@ -4,8 +4,9 @@ import jwt from 'jsonwebtoken';
 import { z } from 'zod';
 import { prisma } from '../db/prisma';
 import { env } from '../config/env';
-import { evaluateAndApply } from '../services/webhook.service';
+import { evaluateAndApply, processWebhookEvent } from '../services/webhook.service';
 import { manualReplay, cancel } from '../services/retry.service';
+import { logger } from '../utils/logger';
 
 // ── auth ─────────────────────────────────────────────────────────────
 const loginSchema = z.object({
@@ -60,7 +61,9 @@ export async function getStats(_req: Request, res: Response): Promise<void> {
 // ── clients ─────────────────────────────────────────────────────────
 const listClientsQuery = z.object({
   q: z.string().optional(),
-  status: z.enum(['ACTIVE', 'BLOCKED', 'CANCELLED', 'UNKNOWN']).optional(),
+  status: z
+    .enum(['ACTIVE', 'BLOCKED', 'CANCELLED', 'UNKNOWN'])
+    .optional(),
   take: z.coerce.number().int().min(1).max(200).default(50),
   skip: z.coerce.number().int().min(0).default(0),
 });
@@ -125,6 +128,76 @@ export async function getClientDetail(
   res.json(client);
 }
 
+// ── PATCH client (operator edits) ───────────────────────────────────
+const patchClientSchema = z
+  .object({
+    contractStartDate: z.string().datetime().optional(),
+    contractEndDate: z.string().datetime().optional(),
+    // Operator override of status. Use sparingly — the BalanceEngine is the
+    // source of truth; manual overrides are for emergency unblocks etc.
+    status: z.enum(['ACTIVE', 'BLOCKED', 'CANCELLED', 'UNKNOWN']).optional(),
+  })
+  .strict();
+
+export async function patchClient(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const id = req.params.id;
+    if (!id) {
+      res.status(400).json({ error: 'missing id' });
+      return;
+    }
+    const parsed = patchClientSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: 'invalid body',
+        details: parsed.error.flatten(),
+      });
+      return;
+    }
+    const data: Record<string, unknown> = {};
+    if (parsed.data.contractStartDate) {
+      data.contractStartDate = new Date(parsed.data.contractStartDate);
+    }
+    if (parsed.data.contractEndDate) {
+      data.contractEndDate = new Date(parsed.data.contractEndDate);
+    }
+    if (parsed.data.status) {
+      data.status = parsed.data.status;
+    }
+    if (Object.keys(data).length === 0) {
+      res.status(400).json({ error: 'no recognised fields' });
+      return;
+    }
+
+    const updated = await prisma.client.update({
+      where: { id },
+      data,
+    });
+
+    await prisma.actionLog.create({
+      data: {
+        clientId: id,
+        kind: 'MANUAL_SYNC',
+        message: `Admin updated client fields: ${Object.keys(data).join(', ')}`,
+        details: data as object,
+      },
+    });
+
+    logger.info(
+      { clientId: id, fields: Object.keys(data) },
+      'admin.client.patched',
+    );
+
+    res.json(updated);
+  } catch (err) {
+    next(err);
+  }
+}
+
 // ── manual sync ─────────────────────────────────────────────────────
 export async function triggerManualSync(
   req: Request,
@@ -151,6 +224,76 @@ export async function triggerManualSync(
   }
 }
 
+// ── notifications (aggregated) ──────────────────────────────────────
+/**
+ * Aggregated dashboard notifications. Pulls actionable items from
+ * existing tables (clients, webhook_events, retry_jobs, sync_runs) so we
+ * don't have to maintain a separate Notification table — every item
+ * already has a row of truth elsewhere.
+ *
+ * Each section returns { count, sample } where `count` is the full count
+ * (used for badges) and `sample` is the 10 newest entries for previews.
+ */
+export async function getNotifications(
+  _req: Request,
+  res: Response,
+): Promise<void> {
+  const SAMPLE = 10;
+
+  const [
+    cancelledCount,
+    cancelledSample,
+    webhookFailureCount,
+    webhookFailureSample,
+    failedRetryCount,
+    failedRetrySample,
+    syncErrorCount,
+    syncErrorSample,
+  ] = await Promise.all([
+    prisma.client.count({ where: { status: 'CANCELLED' } }),
+    prisma.client.findMany({
+      where: { status: 'CANCELLED' },
+      orderBy: { updatedAt: 'desc' },
+      take: SAMPLE,
+      select: { id: true, email: true, name: true, lastSyncedAt: true },
+    }),
+    prisma.webhookEvent.count({ where: { failed: true } }),
+    prisma.webhookEvent.findMany({
+      where: { failed: true },
+      orderBy: { receivedAt: 'desc' },
+      take: SAMPLE,
+      select: {
+        id: true,
+        eventType: true,
+        eventId: true,
+        failureReason: true,
+        receivedAt: true,
+      },
+    }),
+    prisma.retryJob.count({ where: { status: 'FAILED' } }),
+    prisma.retryJob.findMany({
+      where: { status: 'FAILED' },
+      orderBy: { updatedAt: 'desc' },
+      take: SAMPLE,
+      include: { client: { select: { id: true, email: true } } },
+    }),
+    prisma.syncRun.count({ where: { outcome: 'ERROR' } }),
+    prisma.syncRun.findMany({
+      where: { outcome: 'ERROR' },
+      orderBy: { startedAt: 'desc' },
+      take: SAMPLE,
+      include: { client: { select: { id: true, email: true } } },
+    }),
+  ]);
+
+  res.json({
+    cancelled:        { count: cancelledCount,     sample: cancelledSample },
+    webhookFailures:  { count: webhookFailureCount, sample: webhookFailureSample },
+    failedRetries:    { count: failedRetryCount,    sample: failedRetrySample },
+    recentSyncErrors: { count: syncErrorCount,      sample: syncErrorSample },
+  });
+}
+
 // ── logs ────────────────────────────────────────────────────────────
 export async function listActionLogs(
   req: Request,
@@ -175,6 +318,30 @@ export async function listWebhookEvents(
     take,
   });
   res.json({ items });
+}
+
+export async function replayWebhook(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const id = req.params.id;
+    if (!id) {
+      res.status(400).json({ error: 'missing id' });
+      return;
+    }
+    // Reset processed flags so processWebhookEvent re-enters the pipeline.
+    await prisma.webhookEvent.update({
+      where: { id },
+      data: { processed: false, processedAt: null, failed: false, failureReason: null },
+    });
+    // Run inline so the operator gets immediate feedback.
+    await processWebhookEvent(id);
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
 }
 
 // ── retries ─────────────────────────────────────────────────────────

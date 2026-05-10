@@ -8,15 +8,24 @@ import {
 } from '../utils/http';
 import { toMoney } from '../utils/decimal';
 import type { FreshbooksInvoice } from '../types';
+import {
+  getAccessToken,
+  refreshFreshbooksToken,
+} from './freshbooks-token.service';
 
-const TOKEN_EXPIRED_HINT =
-  'FreshBooks rejected the call with 401 — FRESHBOOKS_API_TOKEN is invalid or expired. ' +
-  'Refresh it in FreshBooks → Developer settings, update backend/.env, then restart the server.';
+// 401 here means the refresh-and-retry already ran once and STILL failed —
+// at that point the problem is no longer "expired access token". It's almost
+// always a revoked grant or insufficient scope, and the operator must
+// re-authorize the app. 403 stays an auth error (insufficient scope).
+const REAUTH_HINT =
+  'FreshBooks rejected the call with 401 even after a token refresh+retry. ' +
+  'The grant is likely revoked or out of scope — re-authorize the app and ' +
+  'reseed FRESHBOOKS_API_TOKEN / FRESHBOOKS_API_REFRESH_TOKEN.';
 
 function rewriteAuthError(err: unknown): unknown {
   const status = (err as { status?: number }).status;
   if (status === 401 || status === 403) {
-    return new PermanentHttpError(TOKEN_EXPIRED_HINT, status);
+    return new PermanentHttpError(REAUTH_HINT, status);
   }
   return err;
 }
@@ -48,8 +57,20 @@ export class FreshBooksService {
       baseURL: env.FRESHBOOKS_API_BASE,
       timeoutMs: 20_000,
       defaultHeaders: {
-        Authorization: `Bearer ${env.FRESHBOOKS_API_TOKEN}`,
         'Api-Version': 'alpha',
+      },
+      // Inject the current access token on every request. The token
+      // service caches in memory (~30s) and falls back to the DB row,
+      // so token rotations performed by other nodes are picked up
+      // without us having to do anything.
+      getAuthHeader: async () => `Bearer ${await getAccessToken()}`,
+      // On 401, run the OAuth refresh dance. The token service handles
+      // both in-process coalescing and the cross-node Postgres advisory
+      // lock — only one node in the cluster will actually call the
+      // OAuth endpoint, regardless of how many in-flight requests 401
+      // simultaneously.
+      onUnauthorized: async () => {
+        await refreshFreshbooksToken();
       },
     });
   }
@@ -65,6 +86,51 @@ export class FreshBooksService {
       const res = await this.http.get(url);
       const result = res.data?.response?.result ?? res.data?.response ?? res.data;
       return (result?.client ?? result?.userclient ?? null) as Record<string, unknown> | null;
+    } catch (err) {
+      const status = (err as { status?: number }).status;
+      if (status === 404) return null;
+      throw rewriteAuthError(err);
+    }
+  }
+
+  /**
+   * Fetch a single invoice and return its FreshBooks customerid. The
+   * form-encoded webhook payload only carries the invoice id (`object_id`)
+   * and a staff `user_id` — the actual customer is only available by
+   * looking the invoice up.
+   *
+   * Returns null on 404 (e.g. hard-deleted invoice) or when the invoice
+   * has no customerid.
+   */
+  async getInvoiceCustomerId(invoiceId: string): Promise<string | null> {
+    const url = `/accounting/account/${this.accountId}/invoices/invoices/${invoiceId}`;
+    try {
+      const res = await this.http.get(url);
+      const result = res.data?.response?.result ?? res.data?.response ?? res.data;
+      const invoice = result?.invoice as Record<string, unknown> | undefined;
+      const customerid = invoice?.customerid;
+      return customerid !== undefined && customerid !== null ? String(customerid) : null;
+    } catch (err) {
+      const status = (err as { status?: number }).status;
+      if (status === 404) return null;
+      throw rewriteAuthError(err);
+    }
+  }
+
+  /**
+   * Fetch a single payment. Same form-encoded problem as invoices: the
+   * webhook only carries the payment id, so we have to GET the payment to
+   * find out which client it belongs to AND to record the real amount/date
+   * on the PaymentLog audit row.
+   *
+   * Returns null on 404.
+   */
+  async getPayment(paymentId: string): Promise<Record<string, unknown> | null> {
+    const url = `/accounting/account/${this.accountId}/payments/payments/${paymentId}`;
+    try {
+      const res = await this.http.get(url);
+      const result = res.data?.response?.result ?? res.data?.response ?? res.data;
+      return (result?.payment ?? null) as Record<string, unknown> | null;
     } catch (err) {
       const status = (err as { status?: number }).status;
       if (status === 404) return null;

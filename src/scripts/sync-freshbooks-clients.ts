@@ -9,11 +9,17 @@
  * so contract dates and status set elsewhere are preserved.
  */
 import 'dotenv/config';
-import axios, { AxiosInstance } from 'axios';
+import { AxiosInstance } from 'axios';
 import { env } from '../config/env';
 import { prisma } from '../db/prisma';
 import { logger } from '../utils/logger';
 import { freshbooksService } from '../services/freshbooks.service';
+import {
+  loadTokens as loadFreshbooksTokens,
+  getAccessToken as getFreshbooksAccessToken,
+  refreshFreshbooksToken,
+} from '../services/freshbooks-token.service';
+import { createHttpClient } from '../utils/http';
 
 interface FreshbooksClientRaw {
   id?: number | string;
@@ -40,13 +46,18 @@ interface FreshbooksClientsResponse {
 }
 
 function buildHttp(): AxiosInstance {
-  return axios.create({
+  // Use the shared client factory so this script also picks up the
+  // dynamic-token + 401-auto-refresh behaviour. Without this, a long-running
+  // sync would hit 401 the moment FreshBooks' access-token TTL elapsed
+  // (~12h) and we'd have to restart the process.
+  return createHttpClient({
+    name: 'freshbooks-sync',
     baseURL: env.FRESHBOOKS_API_BASE,
-    timeout: 20_000,
-    headers: {
-      Authorization: `Bearer ${env.FRESHBOOKS_API_TOKEN}`,
-      'Api-Version': 'alpha',
-      'content-type': 'application/json',
+    timeoutMs: 20_000,
+    defaultHeaders: { 'Api-Version': 'alpha' },
+    getAuthHeader: async () => `Bearer ${await getFreshbooksAccessToken()}`,
+    onUnauthorized: async () => {
+      await refreshFreshbooksToken();
     },
   });
 }
@@ -198,6 +209,10 @@ async function syncInvoices(tenantId: string): Promise<{
 }
 
 async function main(): Promise<void> {
+  // Scripts run outside the server process, so they need to hydrate the
+  // oauth_tokens row themselves before making any FreshBooks call.
+  await loadFreshbooksTokens();
+
   const http = buildHttp();
   const tenant = await ensureTenant();
   logger.info({ tenantId: tenant.id }, 'sync.tenant.ready');

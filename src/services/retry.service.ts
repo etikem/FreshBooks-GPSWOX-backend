@@ -2,7 +2,7 @@ import { prisma } from '../db/prisma';
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
 import { RetryStatus } from '@prisma/client';
-import { gpswoxService } from './gpswox.service';
+import { abctrackService } from './abctrack.service';
 
 export type RetryOperation =
   | 'gpswox.enable'
@@ -122,25 +122,40 @@ async function runJob(
   payload: Record<string, unknown>,
   ctx: { clientId: string; idempotencyKey: string },
 ): Promise<void> {
+  // Abctrack's update validator requires `email`. Prefer the value the
+  // webhook captured into the payload at enqueue time; if it isn't there
+  // (older retry rows from before this was threaded through), fall back
+  // to the current DB email so we still satisfy the validator.
+  const email =
+    typeof payload.email === 'string' && payload.email
+      ? payload.email
+      : (await prisma.client.findUnique({
+          where: { id: ctx.clientId },
+          select: { email: true },
+        }))?.email ?? null;
+
   switch (operation) {
     case 'gpswox.enable':
-      await gpswoxService.enable({
+      await abctrackService.enable({
         clientId: ctx.clientId,
         gpswoxUserId: String(payload.gpswoxUserId),
         accessExpiresAt: new Date(String(payload.accessExpiresAt)),
+        email,
       });
       return;
     case 'gpswox.disable':
-      await gpswoxService.disable({
+      await abctrackService.disable({
         clientId: ctx.clientId,
         gpswoxUserId: String(payload.gpswoxUserId),
+        email,
       });
       return;
     case 'gpswox.updateExpiration':
-      await gpswoxService.updateExpiration({
+      await abctrackService.updateExpiration({
         clientId: ctx.clientId,
         gpswoxUserId: String(payload.gpswoxUserId),
         accessExpiresAt: new Date(String(payload.accessExpiresAt)),
+        email,
       });
       return;
     default:

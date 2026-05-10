@@ -6,6 +6,12 @@ import { webhookRouter } from './routes/webhook.routes';
 import { adminRouter } from './routes/admin.routes';
 import { errorHandler } from './middleware/error-handler';
 import { checkFreshbooksTokenAtStartup } from './utils/freshbooks-token';
+import { catchUpUnprocessedEvents } from './services/webhook.service';
+import {
+  loadTokens as loadFreshbooksTokens,
+  getAccessToken as getFreshbooksAccessToken,
+} from './services/freshbooks-token.service';
+import { prisma } from './db/prisma';
 
 const app = express();
 
@@ -35,7 +41,7 @@ app.use((req, res, next) => {
     );
     res.header(
       'Access-Control-Allow-Methods',
-      'GET,POST,PUT,DELETE,OPTIONS',
+      'GET,POST,PUT,PATCH,DELETE,OPTIONS',
     );
   }
   if (req.method === 'OPTIONS') {
@@ -45,14 +51,66 @@ app.use((req, res, next) => {
   next();
 });
 
+// Liveness probe — process is up.
 app.get('/health', (_req, res) => res.json({ ok: true }));
+
+// Readiness probe — process is up AND can talk to the DB.
+app.get('/health/db', async (_req, res) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    res.json({ ok: true });
+  } catch (err) {
+    logger.warn({ err: (err as Error).message }, 'health.db.failed');
+    res.status(503).json({ ok: false, error: 'db unreachable' });
+  }
+});
 
 app.use('/admin', adminRouter);
 
 app.use(errorHandler);
 
-checkFreshbooksTokenAtStartup(env.FRESHBOOKS_API_TOKEN);
+async function bootstrap(): Promise<void> {
+  // Hydrate the oauth_tokens row (creating it from .env on first run) so the
+  // first FreshBooks API call doesn't have to do it lazily. Failing to load
+  // tokens at boot is fatal — every downstream call would 401.
+  try {
+    await loadFreshbooksTokens();
+  } catch (err) {
+    logger.fatal(
+      { err: (err as Error).message },
+      'boot.freshbooks_tokens.load_failed',
+    );
+    process.exit(1);
+  }
 
-app.listen(env.PORT, () => {
-  logger.info({ port: env.PORT, env: env.NODE_ENV }, 'server.started');
+  // Best-effort: surface "the access token we just loaded is already
+  // expired" at boot rather than on the first 401. The OAuth refresh
+  // pipeline will recover automatically on the first real request, but
+  // the warning helps operators understand what they're seeing in logs.
+  try {
+    checkFreshbooksTokenAtStartup(await getFreshbooksAccessToken());
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message },
+      'boot.freshbooks_tokens.expiry_check_failed',
+    );
+  }
+
+  app.listen(env.PORT, () => {
+    logger.info({ port: env.PORT, env: env.NODE_ENV }, 'server.started');
+
+    // Catch-up sweep — process any webhook events the previous run died
+    // mid-flight on. Run after listen so a slow sweep doesn't delay
+    // serving traffic. Failures here are logged but do not affect the API.
+    if (env.CATCHUP_SWEEP_ON_BOOT) {
+      catchUpUnprocessedEvents().catch((err) =>
+        logger.warn({ err: (err as Error).message }, 'webhook.catchup.fatal'),
+      );
+    }
+  });
+}
+
+bootstrap().catch((err) => {
+  logger.fatal({ err: (err as Error).message }, 'boot.fatal');
+  process.exit(1);
 });

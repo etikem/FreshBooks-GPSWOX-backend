@@ -104,7 +104,7 @@ describe('BalanceEngine — strict outstanding rules', () => {
 describe('decideAccess — contract-aware', () => {
   const today = new Date('2026-04-30');
 
-  it('RESTORES when paid-through is in the future and balance is zero', () => {
+  it('RESTORES and snaps the expiration to the next 10th-of-month 08:00 UTC', () => {
     const d = decideAccess({
       invoices: [
         inv({ balance: '0', dueDate: new Date('2026-05-31'), status: 'paid' }),
@@ -113,8 +113,9 @@ describe('decideAccess — contract-aware', () => {
       now: today,
     });
     expect(d.shouldRestore).toBe(true);
-    expect(d.effectiveAccessExpiresAt?.toISOString().slice(0, 10)).toBe(
-      '2026-05-31',
+    // paid-through 2026-05-31 ⇒ snap-forward to 2026-06-10 08:00 UTC.
+    expect(d.effectiveAccessExpiresAt?.toISOString()).toBe(
+      '2026-06-10T08:00:00.000Z',
     );
   });
 
