@@ -13,6 +13,7 @@
     "worker": "tsx src/workers/retry.worker.ts",
     "worker:start": "node dist/workers/retry.worker.js",
     "sync:clients": "tsx src/scripts/sync-freshbooks-clients.ts",
+    "sync:unknown": "tsx src/scripts/sync-unknown-clients.ts",
     "oauth:seed": "tsx src/scripts/seed-oauth-tokens.ts",
     "test": "vitest run",
     "test:watch": "vitest",
