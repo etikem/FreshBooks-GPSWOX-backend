@@ -133,9 +133,13 @@ const patchClientSchema = z
   .object({
     contractStartDate: z.string().datetime().optional(),
     contractEndDate: z.string().datetime().optional(),
-    // Operator override of status. Use sparingly — the BalanceEngine is the
+    // Operator override of status. Use sparingly — the access engine is the
     // source of truth; manual overrides are for emergency unblocks etc.
     status: z.enum(['ACTIVE', 'BLOCKED', 'CANCELLED', 'UNKNOWN']).optional(),
+    // Manual unlimited flag — bypasses billing entirely. Toggling either
+    // way triggers an immediate evaluateAndApply so ABC Track reflects the
+    // change without waiting for the next webhook.
+    isUnlimited: z.boolean().optional(),
   })
   .strict();
 
@@ -168,6 +172,9 @@ export async function patchClient(
     if (parsed.data.status) {
       data.status = parsed.data.status;
     }
+    if (typeof parsed.data.isUnlimited === 'boolean') {
+      data.isUnlimited = parsed.data.isUnlimited;
+    }
     if (Object.keys(data).length === 0) {
       res.status(400).json({ error: 'no recognised fields' });
       return;
@@ -191,6 +198,24 @@ export async function patchClient(
       { clientId: id, fields: Object.keys(data) },
       'admin.client.patched',
     );
+
+    // If isUnlimited or status changed, propagate to ABC Track immediately
+    // rather than waiting for the next webhook. Best-effort — patch
+    // response still returns even if the downstream sync fails.
+    if (
+      typeof parsed.data.isUnlimited === 'boolean' ||
+      parsed.data.status === 'ACTIVE' ||
+      parsed.data.status === 'BLOCKED'
+    ) {
+      try {
+        await evaluateAndApply({ clientId: id, trigger: 'MANUAL' });
+      } catch (syncErr) {
+        logger.warn(
+          { clientId: id, err: (syncErr as Error).message },
+          'admin.patch.sync-failed',
+        );
+      }
+    }
 
     res.json(updated);
   } catch (err) {

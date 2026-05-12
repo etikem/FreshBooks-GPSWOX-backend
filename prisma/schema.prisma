@@ -67,13 +67,23 @@ model Client {
 
   contractStartDate   DateTime
   contractEndDate     DateTime
-  // Latest date the client has paid through, derived from invoices.
+  // Legacy — populated by the old invoice-driven engine. No longer
+  // written. Kept for historical display.
   paidThroughDate     DateTime?
-  // Latest date ABC Track is set to expire (mirror of what we pushed to ABC Track).
+  // Latest date ABC Track is set to expire. NULL means either no expiration
+  // is configured on ABC Track (unlimited clients send enable_expiration_date=0)
+  // or no payment has been received yet (BLOCKED).
   accessExpiresAt     DateTime?
+  // Manual unlimited flag — bypasses billing automation entirely. When true,
+  // the client is held ACTIVE with no ABC Track expiration regardless of
+  // payment state.
+  isUnlimited         Boolean      @default(false)
+  // Wall-clock of the most recent successful payment we've observed. Mirror
+  // of MAX(PaymentLog.paidAt). Drives the access decision.
+  lastPaymentAt       DateTime?
 
   status              ClientStatus @default(UNKNOWN)
-  // Last computed outstanding balance, stored as numeric for safety.
+  // Legacy — populated by the old invoice-driven engine. No longer written.
   lastOutstanding     Decimal?     @db.Decimal(14, 2)
   lastSyncedAt        DateTime?
 
@@ -89,6 +99,8 @@ model Client {
   @@unique([tenantId, freshbooksClientId])
   @@index([email])
   @@index([status])
+  @@index([isUnlimited])
+  @@index([lastPaymentAt])
   @@map("clients")
 }
 

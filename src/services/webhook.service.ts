@@ -13,6 +13,25 @@ import { TransientHttpError } from '../utils/http';
 import { toMoney } from '../utils/decimal';
 
 /**
+ * Recompute Client.lastPaymentAt from the PaymentLog table. Called after
+ * any write to PaymentLog (insert on payment.create, delete on
+ * payment.delete). MAX(paidAt) is the authoritative value — denormalised
+ * onto the Client row so the decision engine and cron sweep don't need a
+ * subquery for every read.
+ */
+async function refreshLastPaymentAt(clientId: string): Promise<void> {
+  const latest = await prisma.paymentLog.findFirst({
+    where: { clientId, paidAt: { not: null } },
+    orderBy: { paidAt: 'desc' },
+    select: { paidAt: true },
+  });
+  await prisma.client.update({
+    where: { id: clientId },
+    data: { lastPaymentAt: latest?.paidAt ?? null },
+  });
+}
+
+/**
  * Verify the HMAC signature of a FreshBooks webhook. The header name varies
  * by API version; the controller already tries the common spellings before
  * calling us. Used as a fallback path — the modern form-encoded webhooks
@@ -427,14 +446,22 @@ export async function processWebhookEvent(webhookEventId: string): Promise<void>
       );
     }
 
-    // Record the payment event before we re-evaluate. The audit row is best-
-    // effort — failure here must not block the access decision. Form-encoded
+    // Record the payment event before we re-evaluate. Form-encoded
     // payment webhooks don't carry amount/date/etc., so prefer the payment
     // record we fetched above when present.
+    //
+    // payment.delete / refund: drop the matching PaymentLog row so the
+    // decision engine sees the reversal. If this was the latest payment,
+    // `lastPaymentAt` falls back to the next-newest row (or null).
     if (isPaymentEvent && !isDelete) {
       const paymentObj = fetchedPayment ?? obj;
       await recordPaymentLog(client.id, payload, paymentObj).catch((e) =>
         logger.warn({ err: e?.message }, 'payment-log.write.failed'),
+      );
+    } else if (isPaymentEvent && isDelete) {
+      const paymentObj = fetchedPayment ?? obj;
+      await deletePaymentLog(client.id, payload, paymentObj).catch((e) =>
+        logger.warn({ err: e?.message }, 'payment-log.delete.failed'),
       );
     }
 
@@ -514,6 +541,35 @@ async function recordPaymentLog(
       rawPayload: payload as Prisma.InputJsonValue,
     },
   });
+
+  // Keep the denormalised `lastPaymentAt` on Client in sync. The decision
+  // engine reads it directly.
+  await refreshLastPaymentAt(clientId);
+}
+
+/**
+ * Handle a payment.delete / refund webhook by dropping the matching
+ * PaymentLog row(s). The access decision is rerun by the caller; if this
+ * was the latest payment, `lastPaymentAt` falls back to the next-newest
+ * row (or null if no payments remain).
+ */
+async function deletePaymentLog(
+  clientId: string,
+  payload: Record<string, unknown>,
+  obj: Record<string, unknown>,
+): Promise<void> {
+  const freshbooksPaymentId =
+    (obj.id as string | number | undefined)?.toString() ??
+    (payload.object_id as string | undefined) ??
+    null;
+  if (!freshbooksPaymentId) {
+    logger.warn({ clientId }, 'payment-log.delete.no-id');
+    return;
+  }
+  await prisma.paymentLog.deleteMany({
+    where: { clientId, freshbooksPaymentId },
+  });
+  await refreshLastPaymentAt(clientId);
 }
 
 /**
@@ -621,9 +677,11 @@ async function tryAutoMapGpswoxUser(
     }
 
     // No ABC Track user with this email — create one to keep FreshBooks and
-    // ABC Track in sync. The new user starts active=1 with the contract end
-    // date as expiration; evaluateAndApply will downgrade them to disabled
-    // immediately if they have unpaid invoices.
+    // ABC Track in sync. Access is payment-driven, so the new user starts
+    // INACTIVE with no expiration; the first successful payment webhook
+    // (or a manual sync after a backfill) flips them to active via
+    // evaluateAndApply. Unlimited clients are an exception — they're
+    // created active with no expiration.
     //
     // We skip auto-create when the FreshBooks profile lacked an email and we
     // saved the placeholder — pushing `freshbooks-<id>@no-email.local` onto
@@ -654,6 +712,9 @@ async function tryAutoMapGpswoxUser(
       .filter((v) => typeof v === 'string' && v.length > 0)
       .join('\n');
 
+    // Unlimited → create active with no expiration. Everyone else →
+    // create INACTIVE with no expiration; evaluateAndApply will flip them
+    // active the moment a payment lands.
     const newGpswoxUserId = await abctrackService.createUser({
       clientId: client.id,
       email: client.email,
@@ -661,7 +722,8 @@ async function tryAutoMapGpswoxUser(
       firstName: client.firstName,
       lastName: client.lastName,
       address: addressLine || null,
-      accessExpiresAt: client.contractEndDate,
+      active: client.isUnlimited === true,
+      accessExpiresAt: null,
     });
 
     const updated = await prisma.client.update({
@@ -845,14 +907,15 @@ function nullEmpty(value: unknown): string | null {
  * Single decision pipeline used by the webhook handler, the manual sync
  * admin endpoint, and the cron sweep. Always:
  *
- *   1. Refetch invoices from FreshBooks (truth).
- *   2. Compute outstanding via BalanceEngine.
- *   3. Apply the decision to ABC Track.
- *   4. Update the Client row.
- *   5. Persist a SyncRun record.
+ *   1. Read the client's lastPaymentAt (denormalised from PaymentLog).
+ *   2. Refresh the invoice cache from FreshBooks for the dashboard
+ *      (best-effort — invoices no longer drive access).
+ *   3. Run the payment-driven access engine.
+ *   4. Apply the decision to ABC Track.
+ *   5. Update the Client row + persist a SyncRun record.
  *
- * If FreshBooks itself is unreachable we BLOCK and enqueue a retry — we
- * NEVER act on stale state.
+ * Unlimited clients short-circuit: they're held ACTIVE with no ABC Track
+ * expiration regardless of payment state.
  */
 export async function evaluateAndApply(args: {
   clientId: string;
@@ -879,18 +942,26 @@ export async function evaluateAndApply(args: {
   }
 
   try {
-    const invoices = await freshbooksService.listInvoicesForClient(
-      client.freshbooksClientId,
-    );
-
-    // Refresh local cache for the dashboard. Best-effort.
-    await refreshInvoiceCache(client.id, invoices).catch((e) =>
-      logger.warn({ err: e?.message }, 'invoice-cache.refresh.failed'),
-    );
+    // Best-effort refresh of the invoice cache for the dashboard. The
+    // access decision no longer consults it. Skipped on FreshBooks
+    // failure — we don't want a flaky FreshBooks to wedge access state
+    // for unlimited or already-paid clients.
+    try {
+      const invoices = await freshbooksService.listInvoicesForClient(
+        client.freshbooksClientId,
+      );
+      await refreshInvoiceCache(client.id, invoices);
+    } catch (e) {
+      logger.warn(
+        { err: (e as Error).message, clientId: client.id },
+        'invoice-cache.refresh.failed',
+      );
+    }
 
     const decision = decideAccess({
-      invoices,
+      isUnlimited: client.isUnlimited,
       contractEndDate: client.contractEndDate,
+      latestPaymentAt: client.lastPaymentAt,
       now: new Date(),
     });
 
@@ -900,26 +971,24 @@ export async function evaluateAndApply(args: {
         kind: decision.shouldRestore ? 'DECISION_RESTORE' : 'DECISION_BLOCK',
         message: decision.reason,
         details: {
-          outstanding: decision.outstanding.toFixed(2),
-          paidThroughDate: decision.paidThroughDate?.toISOString() ?? null,
-          perInvoice: decision.perInvoice as object,
+          isUnlimited: decision.isUnlimited,
+          latestPaymentAt: decision.latestPaymentAt?.toISOString() ?? null,
+          effectiveAccessExpiresAt:
+            decision.effectiveAccessExpiresAt?.toISOString() ?? null,
         },
       },
     });
 
-    if (decision.shouldRestore && decision.effectiveAccessExpiresAt) {
+    if (decision.shouldRestore) {
       if (!client.gpswoxUserId) {
         // No ABC Track user matches this client's email. The operator needs
         // to create a matching user in ABC Track; the next sync will link it.
-        // Surface clearly in the SyncRun so the dashboard explains it.
         const note =
           "Decision was RESTORE, but no ABC Track user has this client's email. Create a user in ABC Track with this email so the next sync can enable access.";
         await prisma.client.update({
           where: { id: client.id },
           data: {
             // Don't flip ACTIVE prematurely — keep prior status until mapped.
-            lastOutstanding: decision.outstanding.toFixed(2),
-            paidThroughDate: decision.paidThroughDate,
             lastSyncedAt: new Date(),
           },
         });
@@ -927,8 +996,6 @@ export async function evaluateAndApply(args: {
           where: { id: run.id },
           data: {
             outcome: 'NO_CHANGE',
-            outstanding: decision.outstanding.toFixed(2),
-            paidThroughDate: decision.paidThroughDate,
             finishedAt: new Date(),
             notes: note,
           },
@@ -946,8 +1013,6 @@ export async function evaluateAndApply(args: {
         where: { id: client.id },
         data: {
           status: 'ACTIVE',
-          lastOutstanding: decision.outstanding.toFixed(2),
-          paidThroughDate: decision.paidThroughDate,
           accessExpiresAt: decision.effectiveAccessExpiresAt,
           lastSyncedAt: new Date(),
         },
@@ -956,15 +1021,12 @@ export async function evaluateAndApply(args: {
         where: { id: run.id },
         data: {
           outcome: 'RESTORED',
-          outstanding: decision.outstanding.toFixed(2),
-          paidThroughDate: decision.paidThroughDate,
           finishedAt: new Date(),
           notes: decision.reason,
         },
       });
     } else {
-      // BLOCK path. Note: we still call disable so a previously-enabled
-      // user is positively shut off if they fall into arrears.
+      // BLOCK path. Disable the ABC Track user if not already blocked.
       if (client.gpswoxUserId && client.status !== 'BLOCKED') {
         await applyDisable({
           clientId: client.id,
@@ -976,8 +1038,7 @@ export async function evaluateAndApply(args: {
         where: { id: client.id },
         data: {
           status: 'BLOCKED',
-          lastOutstanding: decision.outstanding.toFixed(2),
-          paidThroughDate: decision.paidThroughDate ?? client.paidThroughDate,
+          accessExpiresAt: null,
           lastSyncedAt: new Date(),
         },
       });
@@ -985,8 +1046,6 @@ export async function evaluateAndApply(args: {
         where: { id: run.id },
         data: {
           outcome: 'BLOCKED',
-          outstanding: decision.outstanding.toFixed(2),
-          paidThroughDate: decision.paidThroughDate,
           finishedAt: new Date(),
           notes: decision.reason,
         },
@@ -1019,7 +1078,8 @@ export async function evaluateAndApply(args: {
 async function applyEnable(args: {
   clientId: string;
   gpswoxUserId: string;
-  accessExpiresAt: Date;
+  // null → unlimited (enable_expiration_date=0 in ABC Track).
+  accessExpiresAt: Date | null;
   /** DB-side email, required by Abctrack's update validator. See `abctrackService.enable`. */
   email: string | null;
 }): Promise<void> {
@@ -1027,15 +1087,16 @@ async function applyEnable(args: {
     await abctrackService.enable(args);
   } catch (err) {
     if (err instanceof TransientHttpError) {
+      const expirationLabel = args.accessExpiresAt?.toISOString() ?? 'unlimited';
       await enqueueRetry({
         clientId: args.clientId,
         operation: 'gpswox.enable',
         payload: {
           gpswoxUserId: args.gpswoxUserId,
-          accessExpiresAt: args.accessExpiresAt.toISOString(),
+          accessExpiresAt: args.accessExpiresAt?.toISOString() ?? null,
           email: args.email,
         },
-        idempotencyKey: `enable:${args.clientId}:${args.accessExpiresAt.toISOString()}`,
+        idempotencyKey: `enable:${args.clientId}:${expirationLabel}`,
         initialError: err.message,
       });
       return;

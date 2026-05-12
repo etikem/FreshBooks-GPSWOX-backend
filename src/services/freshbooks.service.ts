@@ -139,6 +139,91 @@ export class FreshBooksService {
   }
 
   /**
+   * Fetch ALL payments for a given FreshBooks client (paginates internally).
+   * Used by the backfill script and the manual-sync path to reconcile our
+   * local PaymentLog table against FreshBooks. Throws on transient errors
+   * so the caller can enqueue a retry.
+   *
+   * Returns minimal-shape rows — id, paidAt, amount, currency, invoiceId.
+   * The rawPayload field on PaymentLog stores the full record.
+   */
+  async listPaymentsForClient(freshbooksClientId: string): Promise<
+    Array<{
+      id: string;
+      paidAt: Date | null;
+      amount: import('decimal.js').default | null;
+      currency: string;
+      invoiceId: string | null;
+      raw: Record<string, unknown>;
+    }>
+  > {
+    const all: Array<{
+      id: string;
+      paidAt: Date | null;
+      amount: import('decimal.js').default | null;
+      currency: string;
+      invoiceId: string | null;
+      raw: Record<string, unknown>;
+    }> = [];
+    let page = 1;
+    const perPage = 100;
+    const maxPages = 200;
+
+    while (page <= maxPages) {
+      const url = `/accounting/account/${this.accountId}/payments/payments`;
+      let res;
+      try {
+        res = await this.http.get(url, {
+          params: {
+            'search[clientid]': freshbooksClientId,
+            per_page: perPage,
+            page,
+          },
+        });
+      } catch (err) {
+        throw rewriteAuthError(err);
+      }
+
+      const result = res.data?.response?.result ?? res.data?.response ?? res.data;
+      const payments = (result?.payments ?? []) as unknown[];
+      const totalPages = Number(result?.pages ?? 1);
+
+      for (const raw of payments) {
+        if (!raw || typeof raw !== 'object') continue;
+        const r = raw as Record<string, unknown>;
+        // Skip soft-deleted payments — FreshBooks marks reversals as vis_state=1.
+        const visState = Number(r.vis_state ?? 0);
+        if (visState === 1) continue;
+        const id = (r.id ?? r.paymentid) as string | number | undefined;
+        if (id === undefined) continue;
+        all.push({
+          id: String(id),
+          paidAt: parseDate(r.date ?? r.paid_date ?? r.created_at),
+          amount: readMoney(r.amount),
+          currency:
+            ((typeof r.amount === 'object' && r.amount && 'code' in (r.amount as object)
+              ? (r.amount as { code?: string }).code
+              : (r.currency_code as string | undefined)) as string | undefined) ?? 'USD',
+          invoiceId:
+            (r.invoiceid as string | number | undefined)?.toString() ??
+            (r.invoice_id as string | undefined) ??
+            null,
+          raw: r,
+        });
+      }
+
+      if (page >= totalPages) break;
+      page += 1;
+    }
+
+    logger.info(
+      { freshbooksClientId, count: all.length },
+      'freshbooks.payments.fetched',
+    );
+    return all;
+  }
+
+  /**
    * Fetch ALL invoices for a given FreshBooks client (paginates internally).
    * Throws on transient errors so the caller can enqueue a retry.
    */

@@ -5,19 +5,23 @@ import { evaluateAndApply } from './webhook.service';
 /**
  * Daily / hourly sweep for clients whose access window has elapsed.
  *
- * Why: webhooks fire on FreshBooks state changes. If a client's
- * `paidThroughDate` lapses without a new invoice or payment event, no
- * webhook fires and the client stays ACTIVE in our DB even though their
- * paid-through window has passed. This sweep re-evaluates them so the
- * BalanceEngine's "paid-through in the past → BLOCK" rule kicks in.
+ * Why: webhooks fire on FreshBooks state changes. If a client's payment
+ * coverage lapses without a new payment event, no webhook fires and the
+ * client stays ACTIVE in our DB even though their next-month-10th
+ * deadline has passed. This sweep re-evaluates them so the access engine
+ * blocks them on schedule.
  *
  * Selection criteria:
  *   - status = ACTIVE
- *   - accessExpiresAt < now  (their stored access window has run out)
+ *   - isUnlimited = false   (unlimited clients bypass billing entirely)
+ *   - accessExpiresAt < now (their stored access window has run out)
+ *
+ * Unlimited clients are explicitly excluded — they have no expiration
+ * and should never be auto-blocked by this sweep.
  *
  * We chunk through clients in batches and call `evaluateAndApply`, which
- * refetches FreshBooks and applies the strict rules. Errors on individual
- * clients don't abort the sweep.
+ * applies the payment-driven rules. Errors on individual clients don't
+ * abort the sweep.
  */
 export async function runCronSweepOnce(now: Date = new Date()): Promise<{
   examined: number;
@@ -28,6 +32,7 @@ export async function runCronSweepOnce(now: Date = new Date()): Promise<{
   const due = await prisma.client.findMany({
     where: {
       status: 'ACTIVE',
+      isUnlimited: false,
       accessExpiresAt: { lt: now },
     },
     select: { id: true, email: true },

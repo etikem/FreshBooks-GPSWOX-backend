@@ -463,14 +463,22 @@ class AbctrackService {
   }
 
   /**
-   * Enable a client and set/extend their access expiration in one call.
-   * Maps to `PUT /ui/admin/client/{id}` with active=1 and the new
-   * expiration_date.
+   * Enable a client and (optionally) set their access expiration.
+   * Maps to `PUT /ui/admin/client/{id}` with active=1.
+   *
+   * `accessExpiresAt`:
+   *   - Date  → send `enable_expiration_date=1` + formatted `expiration_date`.
+   *   - null  → ONLY override `active=1`. Do NOT touch
+   *             `enable_expiration_date` or `expiration_date` — the
+   *             fetch-then-update round-trip preserves whatever the
+   *             operator has set manually in ABC Track. Used for
+   *             unlimited accounts: our system bypasses billing entirely
+   *             and the operator owns the expiration field on their end.
    */
   async enable(args: {
     clientId: string;
     gpswoxUserId: string;
-    accessExpiresAt: Date;
+    accessExpiresAt: Date | null;
     /**
      * The DB-side email. Threaded in because the per-id GET doesn't always
      * surface a usable `email` on the existing record (response is wrapped
@@ -482,12 +490,19 @@ class AbctrackService {
     email?: string | null;
   }): Promise<void> {
     const id = this.toClientId(args.gpswoxUserId);
-    const expiration_date = this.formatExpiration(args.accessExpiresAt);
-    const overrides: Record<string, unknown> = {
-      active: 1,
-      enable_expiration_date: 1,
-      expiration_date,
-    };
+    const overrides: Record<string, unknown> =
+      args.accessExpiresAt === null
+        ? {
+            // Unlimited path: only enforce active=1. Leave
+            // enable_expiration_date and expiration_date untouched so the
+            // operator's manual settings in ABC Track survive our update.
+            active: 1,
+          }
+        : {
+            active: 1,
+            enable_expiration_date: 1,
+            expiration_date: this.formatExpiration(args.accessExpiresAt),
+          };
     if (args.email) overrides.email = args.email;
     await this.withAudit(
       {
@@ -582,20 +597,27 @@ class AbctrackService {
 
   /**
    * Extend expiration without touching `active`. Useful when a payment
-   * arrives for a still-active client.
+   * arrives for a still-active client. Pass `accessExpiresAt: null` to
+   * leave the operator-set expiration alone (no-op write, used only for
+   * symmetry with `enable`).
    */
   async updateExpiration(args: {
     clientId: string;
     gpswoxUserId: string;
-    accessExpiresAt: Date;
+    accessExpiresAt: Date | null;
     /** See `enable` — the update validator requires email. */
     email?: string | null;
   }): Promise<void> {
     const id = this.toClientId(args.gpswoxUserId);
-    const expiration_date = this.formatExpiration(args.accessExpiresAt);
+    if (args.accessExpiresAt === null) {
+      // No-op: there's nothing to push when the caller doesn't have a
+      // date to assert. Operator-managed expirations on unlimited
+      // accounts are owned by the ABC Track admin UI, not us.
+      return;
+    }
     const overrides: Record<string, unknown> = {
       enable_expiration_date: 1,
-      expiration_date,
+      expiration_date: this.formatExpiration(args.accessExpiresAt),
     };
     if (args.email) overrides.email = args.email;
     await this.withAudit(
@@ -701,7 +723,23 @@ class AbctrackService {
     firstName?: string | null;
     lastName?: string | null;
     address?: string | null;
-    accessExpiresAt: Date;
+    /**
+     * Whether the new ABC Track user starts active. Defaults to true for
+     * backwards compatibility, but the auto-create path passes false when
+     * the FreshBooks client has no payment on record — payment-driven
+     * access blocks until the first payment webhook flips them on.
+     */
+    active?: boolean;
+    /**
+     * Expiration to seed on the new row.
+     *   - Date  → enable_expiration_date=1, formatted date
+     *   - null  → enable_expiration_date=0, empty. Used when no payment
+     *             has been received yet, or when the client is being
+     *             created as unlimited (the operator can set their own
+     *             expiration in ABC Track later; subsequent enable calls
+     *             will leave it alone — see `enable`).
+     */
+    accessExpiresAt: Date | null;
   }): Promise<number> {
     // Field insertion order mirrors the captured admin-UI submission to
     // POST /ui/admin/client byte-for-byte (modulo boundary). User-supplied
@@ -710,16 +748,20 @@ class AbctrackService {
     // ABCTRACK_CREATE_TABLE_STATE. Object literals iterate in insertion
     // order, and appendField walks them in iteration order — so the wire
     // body matches the captured form's field sequence.
+    const active = args.active === false ? 0 : 1;
+    const expirationEnabled = args.accessExpiresAt === null ? 0 : 1;
+    const expirationDate =
+      args.accessExpiresAt === null ? '' : this.formatExpiration(args.accessExpiresAt);
     const fields: Record<string, unknown> = {
-      active: 1,
+      active,
       email: args.email,
       phone_number: args.phoneNumber ?? '',
       group_id: CLIENT_CREATE_DEFAULTS.group_id,
       enable_manager_id: CLIENT_CREATE_DEFAULTS.enable_manager_id,
       available_maps: CLIENT_CREATE_DEFAULTS.available_maps,
       enable_devices_limit: CLIENT_CREATE_DEFAULTS.enable_devices_limit,
-      enable_expiration_date: 1,
-      expiration_date: this.formatExpiration(args.accessExpiresAt),
+      enable_expiration_date: expirationEnabled,
+      expiration_date: expirationDate,
       password_generate: CLIENT_CREATE_DEFAULTS.password_generate,
       account_created: CLIENT_CREATE_DEFAULTS.account_created,
       perms: CLIENT_CREATE_DEFAULTS.perms,

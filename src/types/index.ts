@@ -16,24 +16,26 @@ export interface FreshbooksInvoice {
   dueDate: Date | null;
 }
 
-export interface BalanceDecision {
-  // Outstanding total across ALL invoices, in client currency.
-  outstanding: Decimal;
-  // True only when outstanding === 0 AND every invoice was parseable.
-  // If any invoice had ambiguous data, this is FALSE.
+/**
+ * Output of the payment-driven access engine. See balance.engine.ts.
+ *
+ * `effectiveAccessExpiresAt` is what we push to ABC Track:
+ *   - A Date when access is granted with a normal expiration.
+ *   - null when shouldRestore is true AND isUnlimited is true (the client
+ *     has no expiration on ABC Track — `enable_expiration_date=0`).
+ *   - null when shouldRestore is false (access is blocked).
+ *
+ * Callers MUST inspect `isUnlimited` to disambiguate the two null cases.
+ */
+export interface AccessDecision {
   shouldRestore: boolean;
-  // Most recent dueDate among PAID invoices. Null if no fully-paid invoice
-  // could be identified — which means we cannot extend access either.
-  paidThroughDate: Date | null;
-  // Why we decided what we decided. Stored verbatim in ActionLog.
+  isUnlimited: boolean;
+  // Most recent successful payment used to compute expiration. Null for
+  // unlimited clients (we don't care) and for the no-payment-block case.
+  latestPaymentAt: Date | null;
+  effectiveAccessExpiresAt: Date | null;
+  // Human-readable explanation, written to ActionLog.
   reason: string;
-  // Per-invoice rollup for the audit trail.
-  perInvoice: Array<{
-    id: string;
-    balance: string;
-    status: string;
-    parseable: boolean;
-  }>;
 }
 
 export interface DecisionContext {
