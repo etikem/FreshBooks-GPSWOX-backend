@@ -3,7 +3,7 @@ import jwt from 'jsonwebtoken';
 import { env } from '../config/env';
 
 export interface AuthedRequest extends Request {
-  admin?: { email: string };
+  admin?: { username: string };
 }
 
 export function requireAdmin(
@@ -18,8 +18,8 @@ export function requireAdmin(
   }
   const token = header.slice('Bearer '.length);
   try {
-    const decoded = jwt.verify(token, env.JWT_SECRET) as { email: string };
-    req.admin = { email: decoded.email };
+    const decoded = jwt.verify(token, env.JWT_SECRET) as { username: string };
+    req.admin = { username: decoded.username };
     next();
   } catch {
     res.status(401).json({ error: 'invalid token' });

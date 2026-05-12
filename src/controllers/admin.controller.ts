@@ -10,7 +10,7 @@ import { logger } from '../utils/logger';
 
 // ── auth ─────────────────────────────────────────────────────────────
 const loginSchema = z.object({
-  email: z.string().email(),
+  username: z.string().min(1),
   password: z.string().min(1),
 });
 
@@ -20,8 +20,8 @@ export async function login(req: Request, res: Response): Promise<void> {
     res.status(400).json({ error: 'invalid body' });
     return;
   }
-  const { email, password } = parsed.data;
-  if (email.toLowerCase() !== env.ADMIN_EMAIL.toLowerCase()) {
+  const { username, password } = parsed.data;
+  if (username.toLowerCase() !== env.ADMIN_USERNAME.toLowerCase()) {
     res.status(401).json({ error: 'invalid credentials' });
     return;
   }
@@ -30,7 +30,7 @@ export async function login(req: Request, res: Response): Promise<void> {
     res.status(401).json({ error: 'invalid credentials' });
     return;
   }
-  const token = jwt.sign({ email }, env.JWT_SECRET, { expiresIn: '12h' });
+  const token = jwt.sign({ username }, env.JWT_SECRET, { expiresIn: '12h' });
   res.json({ token });
 }
 

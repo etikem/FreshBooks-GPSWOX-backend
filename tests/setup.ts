@@ -23,7 +23,7 @@ const required: Record<string, string> = {
   ABCTRACK_PASSWORD: 'test-password',
 
   JWT_SECRET: 'test-jwt-secret-at-least-sixteen-chars',
-  ADMIN_EMAIL: 'admin@example.com',
+  ADMIN_USERNAME: 'administrator',
   // Pre-baked bcrypt hash of "test-password" (cost 4) — value doesn't
   // matter for tests, just has to satisfy the bcrypt-shape regex.
   ADMIN_PASSWORD_HASH: '$2a$04$abcdefghijklmnopqrstuv',

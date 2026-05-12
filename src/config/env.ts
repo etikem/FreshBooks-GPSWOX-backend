@@ -159,7 +159,7 @@ const schema = z.object({
   ABCTRACK_HTTP_TIMEOUT_MS: z.coerce.number().int().positive().default(15000),
 
   JWT_SECRET: jwtSecret,
-  ADMIN_EMAIL: z.string().email(),
+  ADMIN_USERNAME: z.string().min(1),
   ADMIN_PASSWORD_HASH: bcryptHash,
 
   RETRY_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(10_000),
