@@ -320,29 +320,52 @@ export async function getNotifications(
 }
 
 // ── logs ────────────────────────────────────────────────────────────
+const logsPageQuery = z.object({
+  take: z.coerce.number().int().min(1).max(500).default(20),
+  skip: z.coerce.number().int().min(0).default(0),
+});
+
 export async function listActionLogs(
   req: Request,
   res: Response,
 ): Promise<void> {
-  const take = Math.min(Number(req.query.take ?? 100), 500);
-  const items = await prisma.actionLog.findMany({
-    orderBy: { createdAt: 'desc' },
-    take,
-    include: { client: { select: { id: true, email: true } } },
-  });
-  res.json({ items });
+  const parsed = logsPageQuery.safeParse(req.query);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'invalid query' });
+    return;
+  }
+  const { take, skip } = parsed.data;
+  const [items, total] = await Promise.all([
+    prisma.actionLog.findMany({
+      orderBy: { createdAt: 'desc' },
+      take,
+      skip,
+      include: { client: { select: { id: true, email: true } } },
+    }),
+    prisma.actionLog.count(),
+  ]);
+  res.json({ items, total });
 }
 
 export async function listWebhookEvents(
   req: Request,
   res: Response,
 ): Promise<void> {
-  const take = Math.min(Number(req.query.take ?? 100), 500);
-  const items = await prisma.webhookEvent.findMany({
-    orderBy: { receivedAt: 'desc' },
-    take,
-  });
-  res.json({ items });
+  const parsed = logsPageQuery.safeParse(req.query);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'invalid query' });
+    return;
+  }
+  const { take, skip } = parsed.data;
+  const [items, total] = await Promise.all([
+    prisma.webhookEvent.findMany({
+      orderBy: { receivedAt: 'desc' },
+      take,
+      skip,
+    }),
+    prisma.webhookEvent.count(),
+  ]);
+  res.json({ items, total });
 }
 
 export async function replayWebhook(
