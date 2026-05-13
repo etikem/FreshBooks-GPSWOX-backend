@@ -517,9 +517,36 @@ class AbctrackService {
   }
 
   /**
-   * Disable a client. Same fetch-then-PUT, only `active` flips to 0.
-   * We deliberately leave `expiration_date` alone — when the client
-   * pays again, `enable` will re-set it.
+   * Hard-deactivate a client (active=0). Only used when the FreshBooks
+   * client record is deleted — the account is kept in ABC Track but fully
+   * deactivated. For non-paying clients use `disable()` instead, which
+   * blocks via expiration_date and leaves active untouched.
+   */
+  async deactivate(args: {
+    clientId: string;
+    gpswoxUserId: string;
+    email?: string | null;
+  }): Promise<void> {
+    const id = this.toClientId(args.gpswoxUserId);
+    const overrides: Record<string, unknown> = { active: 0 };
+    if (args.email) overrides.email = args.email;
+    await this.withAudit(
+      {
+        clientId: args.clientId,
+        kind: 'GPSWOX_DISABLE',
+        payload: { id, ...overrides },
+      },
+      async () => {
+        await this.fetchAndUpdate({ id, overrides });
+      },
+    );
+  }
+
+  /**
+   * Block a client by setting their expiration_date to now. We never set
+   * active=0 — the expiration date alone is sufficient to prevent login,
+   * and flipping active causes confusion when operators inspect accounts.
+   * When the client pays again, `enable` will set a future expiration_date.
    */
   async disable(args: {
     clientId: string;
@@ -528,7 +555,10 @@ class AbctrackService {
     email?: string | null;
   }): Promise<void> {
     const id = this.toClientId(args.gpswoxUserId);
-    const overrides: Record<string, unknown> = { active: 0 };
+    const overrides: Record<string, unknown> = {
+      enable_expiration_date: 1,
+      expiration_date: this.formatExpiration(new Date()),
+    };
     if (args.email) overrides.email = args.email;
     await this.withAudit(
       {
@@ -724,13 +754,6 @@ class AbctrackService {
     lastName?: string | null;
     address?: string | null;
     /**
-     * Whether the new ABC Track user starts active. Defaults to true for
-     * backwards compatibility, but the auto-create path passes false when
-     * the FreshBooks client has no payment on record — payment-driven
-     * access blocks until the first payment webhook flips them on.
-     */
-    active?: boolean;
-    /**
      * Expiration to seed on the new row.
      *   - Date  → enable_expiration_date=1, formatted date
      *   - null  → enable_expiration_date=0, empty. Used when no payment
@@ -748,7 +771,7 @@ class AbctrackService {
     // ABCTRACK_CREATE_TABLE_STATE. Object literals iterate in insertion
     // order, and appendField walks them in iteration order — so the wire
     // body matches the captured form's field sequence.
-    const active = args.active === false ? 0 : 1;
+    const active = 1;
     const expirationEnabled = args.accessExpiresAt === null ? 0 : 1;
     const expirationDate =
       args.accessExpiresAt === null ? '' : this.formatExpiration(args.accessExpiresAt);

@@ -346,20 +346,21 @@ export async function processWebhookEvent(webhookEventId: string): Promise<void>
           }
         }
 
-        let deleted = false;
+        let blocked = false;
         if (gpswoxUserId && client.status !== 'CANCELLED') {
           try {
-            await abctrackService.deleteUser({
+            await abctrackService.deactivate({
               clientId: client.id,
               gpswoxUserId,
+              email: client.email,
             });
-            deleted = true;
+            blocked = true;
           } catch (err) {
             await prisma.actionLog.create({
               data: {
                 clientId: client.id,
                 kind: 'ERROR',
-                message: `abctrack.deleteUser on client-delete failed: ${(err as Error).message}`,
+                message: `abctrack.disable on client-delete failed: ${(err as Error).message}`,
                 details: { eventId: ev.eventId },
               },
             });
@@ -369,9 +370,6 @@ export async function processWebhookEvent(webhookEventId: string): Promise<void>
           where: { id: client.id },
           data: {
             status: 'CANCELLED',
-            // Drop the mapping once the GPS user is gone so future webhooks
-            // don't try to act on a stale id.
-            gpswoxUserId: deleted ? null : client.gpswoxUserId,
             lastSyncedAt: new Date(),
           },
         });
@@ -381,10 +379,10 @@ export async function processWebhookEvent(webhookEventId: string): Promise<void>
             kind: 'DECISION_BLOCK',
             message: gpswoxUserId
               ? resolvedViaEmail
-                ? 'Client deleted in FreshBooks — resolved ABC Track user via email, hard-deleted, marked CANCELLED.'
-                : 'Client deleted in FreshBooks — ABC Track user hard-deleted, marked CANCELLED.'
+                ? 'Client deleted in FreshBooks — resolved ABC Track user via email, expired access, marked CANCELLED.'
+                : 'Client deleted in FreshBooks — ABC Track access expired, marked CANCELLED.'
               : 'Client deleted in FreshBooks — marked CANCELLED (no ABC Track user found by email).',
-            details: { eventId: ev.eventId, gpswoxUserId, deleted },
+            details: { eventId: ev.eventId, gpswoxUserId, blocked },
           },
         });
       }
@@ -712,9 +710,6 @@ async function tryAutoMapGpswoxUser(
       .filter((v) => typeof v === 'string' && v.length > 0)
       .join('\n');
 
-    // Unlimited → create active with no expiration. Everyone else →
-    // create INACTIVE with no expiration; evaluateAndApply will flip them
-    // active the moment a payment lands.
     const newGpswoxUserId = await abctrackService.createUser({
       clientId: client.id,
       email: client.email,
@@ -722,8 +717,7 @@ async function tryAutoMapGpswoxUser(
       firstName: client.firstName,
       lastName: client.lastName,
       address: addressLine || null,
-      active: client.isUnlimited === true,
-      accessExpiresAt: null,
+      accessExpiresAt: new Date(),
     });
 
     const updated = await prisma.client.update({
