@@ -11,6 +11,7 @@ import { decideAccess } from './balance.engine';
 import { enqueueRetry } from './retry.service';
 import { TransientHttpError } from '../utils/http';
 import { toMoney } from '../utils/decimal';
+import { nextMonthTenthAtEightUtc } from '../utils/expiration';
 
 /**
  * Recompute Client.lastPaymentAt from the PaymentLog table. Called after
@@ -717,7 +718,7 @@ async function tryAutoMapGpswoxUser(
       firstName: client.firstName,
       lastName: client.lastName,
       address: addressLine || null,
-      accessExpiresAt: new Date(),
+      accessExpiresAt: nextMonthTenthAtEightUtc(new Date()),
     });
 
     const updated = await prisma.client.update({
