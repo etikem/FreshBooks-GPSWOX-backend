@@ -405,8 +405,11 @@ export async function processWebhookEvent(webhookEventId: string): Promise<void>
     // Email-driven auto-mapping of the ABC Track user. Idempotent — if the
     // mapping is already set we skip; otherwise we set it from the email
     // lookup, or log an ERROR action when no ABC Track user matches.
+    let autoCreated = false;
     if (client && !client.gpswoxUserId) {
-      client = await tryAutoMapGpswoxUser(client);
+      const result = await tryAutoMapGpswoxUser(client);
+      client = result.client;
+      autoCreated = result.autoCreated;
     }
 
     if (!client) {
@@ -464,11 +467,28 @@ export async function processWebhookEvent(webhookEventId: string): Promise<void>
       );
     }
 
-    await evaluateAndApply({
-      clientId: client.id,
-      trigger: 'WEBHOOK',
-      webhookEventId: ev.id,
-    });
+    // Newly auto-created AT users on client.create events already have
+    // active=1 + expiration=10th-of-next-month set by createUser. Skip
+    // evaluateAndApply so the BLOCK path (no payment yet) doesn't
+    // immediately overwrite that expiration with "now".
+    // For payment/invoice events, always run the full evaluation so any
+    // payment received is reflected immediately.
+    if (autoCreated && !isPaymentEvent && !isInvoiceEvent) {
+      await prisma.actionLog.create({
+        data: {
+          clientId: client.id,
+          kind: 'DECISION_RESTORE',
+          message: `New client — access granted until ${nextMonthTenthAtEightUtc(new Date()).toISOString().slice(0, 10)}.`,
+          details: { effectiveAccessExpiresAt: client.accessExpiresAt?.toISOString() ?? null },
+        },
+      });
+    } else {
+      await evaluateAndApply({
+        clientId: client.id,
+        trigger: 'WEBHOOK',
+        webhookEventId: ev.id,
+      });
+    }
 
     await markProcessed(ev.id);
   } catch (err) {
@@ -641,13 +661,18 @@ async function syncAbctrackProfile(
  * Never throws — failures degrade to a logged warning. The downstream
  * decision pipeline already handles "no gpswoxUserId" cleanly.
  */
+type AutoMapResult = {
+  client: NonNullable<Awaited<ReturnType<typeof clientMappingService.findByFreshbooksClientId>>>;
+  autoCreated: boolean;
+};
+
 async function tryAutoMapGpswoxUser(
   client: NonNullable<Awaited<ReturnType<typeof clientMappingService.findByFreshbooksClientId>>>,
-): Promise<typeof client> {
-  if (client.gpswoxUserId) return client;
-  if (!client.email) return client;
+): Promise<AutoMapResult> {
+  if (client.gpswoxUserId) return { client, autoCreated: false };
+  if (!client.email) return { client, autoCreated: false };
   // Don't flip CANCELLED clients — their lifecycle is over.
-  if (client.status === 'CANCELLED') return client;
+  if (client.status === 'CANCELLED') return { client, autoCreated: false };
 
   try {
     const hit = await abctrackService.findUserByEmail(client.email);
@@ -672,16 +697,9 @@ async function tryAutoMapGpswoxUser(
           details: { gpswoxUserId: hit.id, email: client.email },
         },
       });
-      return updated;
+      return { client: updated, autoCreated: false };
     }
 
-    // No ABC Track user with this email — create one to keep FreshBooks and
-    // ABC Track in sync. Access is payment-driven, so the new user starts
-    // INACTIVE with no expiration; the first successful payment webhook
-    // (or a manual sync after a backfill) flips them to active via
-    // evaluateAndApply. Unlimited clients are an exception — they're
-    // created active with no expiration.
-    //
     // We skip auto-create when the FreshBooks profile lacked an email and we
     // saved the placeholder — pushing `freshbooks-<id>@no-email.local` onto
     // ABC Track would just create garbage rows.
@@ -695,7 +713,7 @@ async function tryAutoMapGpswoxUser(
           details: { email: client.email },
         },
       });
-      return client;
+      return { client, autoCreated: false };
     }
 
     const phoneNumber =
@@ -711,6 +729,7 @@ async function tryAutoMapGpswoxUser(
       .filter((v) => typeof v === 'string' && v.length > 0)
       .join('\n');
 
+    const expiration = nextMonthTenthAtEightUtc(new Date());
     const newGpswoxUserId = await abctrackService.createUser({
       clientId: client.id,
       email: client.email,
@@ -718,16 +737,15 @@ async function tryAutoMapGpswoxUser(
       firstName: client.firstName,
       lastName: client.lastName,
       address: addressLine || null,
-      accessExpiresAt: nextMonthTenthAtEightUtc(new Date()),
+      accessExpiresAt: expiration,
     });
 
     const updated = await prisma.client.update({
       where: { id: client.id },
       data: {
         gpswoxUserId: String(newGpswoxUserId),
-        ...(client.status === 'NO_MATCHING_GPSWOX_USER'
-          ? { status: 'UNKNOWN' }
-          : {}),
+        status: 'ACTIVE',
+        accessExpiresAt: expiration,
         lastSyncedAt: new Date(),
       },
     });
@@ -739,14 +757,14 @@ async function tryAutoMapGpswoxUser(
         details: { gpswoxUserId: newGpswoxUserId, email: client.email },
       },
     });
-    return updated;
+    return { client: updated, autoCreated: true };
   } catch (err) {
     logger.warn(
       { err: (err as Error).message, clientId: client.id },
       'abctrack.auto-match.failed',
     );
   }
-  return client;
+  return { client, autoCreated: false };
 }
 
 /**
