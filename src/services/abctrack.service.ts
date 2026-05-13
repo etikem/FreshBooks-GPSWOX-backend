@@ -287,7 +287,7 @@ class AbctrackService {
         : {};
 
     const fields: Record<string, unknown> = {
-      active: pick('active', 0),
+      active: pick('active', 1),
       email: pick('email', ''),
       phone_number: pick('phone_number', ''),
       group_id: pick('group_id', defaults.group_id),
@@ -556,6 +556,7 @@ class AbctrackService {
   }): Promise<void> {
     const id = this.toClientId(args.gpswoxUserId);
     const overrides: Record<string, unknown> = {
+      active: 1,
       enable_expiration_date: 1,
       expiration_date: this.formatExpiration(new Date()),
     };
