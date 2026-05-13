@@ -438,8 +438,10 @@ export async function processWebhookEvent(webhookEventId: string): Promise<void>
 
     // Push the FreshBooks email + phone onto the ABC Track record so the
     // GPS account stays aligned with whatever the operator just changed.
-    // Best-effort — never blocks the access decision below.
-    if (client.gpswoxUserId) {
+    // Skipped for newly auto-created users — createUser already set the
+    // full profile, and a redundant fetchAndUpdate here would overwrite
+    // the expiration date with unlimited if the GET response lacks it.
+    if (client.gpswoxUserId && !autoCreated) {
       await syncAbctrackProfile(client).catch((e) =>
         logger.warn(
           { err: e?.message, clientId: client!.id },
