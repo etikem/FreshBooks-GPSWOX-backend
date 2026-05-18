@@ -739,6 +739,7 @@ async function tryAutoMapGpswoxUser(
       firstName: client.firstName,
       lastName: client.lastName,
       address: addressLine || null,
+      personalCode: client.freshbooksClientId,
       accessExpiresAt: expiration,
     });
 

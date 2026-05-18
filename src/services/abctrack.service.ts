@@ -610,7 +610,7 @@ class AbctrackService {
         last_name: args.lastName ?? '',
         address: args.address ?? '',
         comment: args.notes ?? '',
-        personal_code: args.personalCode ?? '',
+        personal_code: args.personalCode ? `AT-${args.personalCode}` : '',
       },
     };
     await this.fetchAndUpdate({ id, overrides });
@@ -755,6 +755,13 @@ class AbctrackService {
     lastName?: string | null;
     address?: string | null;
     /**
+     * FreshBooks client id — stamped onto `client[personal_code]` with
+     * an `AT-` prefix (e.g. FreshBooks `206` → `AT-206`). Per-client
+     * requirement: keeps the FreshBooks↔ABC Track linkage visible in
+     * the ABC Track admin UI's ID field.
+     */
+    personalCode?: string | null;
+    /**
      * Expiration to seed on the new row.
      *   - Date  → enable_expiration_date=1, formatted date
      *   - null  → enable_expiration_date=0, empty. Used when no payment
@@ -794,6 +801,7 @@ class AbctrackService {
         first_name: args.firstName ?? '',
         last_name: args.lastName ?? '',
         address: args.address ?? '',
+        personal_code: args.personalCode ? `AT-${args.personalCode}` : '',
       },
       edit_assigned_company: CLIENT_CREATE_DEFAULTS.edit_assigned_company,
       ...ABCTRACK_CREATE_TABLE_STATE,
