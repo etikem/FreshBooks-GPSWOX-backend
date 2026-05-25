@@ -976,7 +976,6 @@ export async function evaluateAndApply(args: {
 
     const decision = decideAccess({
       isUnlimited: client.isUnlimited,
-      contractEndDate: client.contractEndDate,
       latestPaymentAt: client.lastPaymentAt,
       now: new Date(),
     });

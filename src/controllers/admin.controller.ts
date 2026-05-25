@@ -131,8 +131,6 @@ export async function getClientDetail(
 // ── PATCH client (operator edits) ───────────────────────────────────
 const patchClientSchema = z
   .object({
-    contractStartDate: z.string().datetime().optional(),
-    contractEndDate: z.string().datetime().optional(),
     // Operator override of status. Use sparingly — the access engine is the
     // source of truth; manual overrides are for emergency unblocks etc.
     status: z.enum(['ACTIVE', 'BLOCKED', 'CANCELLED', 'UNKNOWN']).optional(),
@@ -163,12 +161,6 @@ export async function patchClient(
       return;
     }
     const data: Record<string, unknown> = {};
-    if (parsed.data.contractStartDate) {
-      data.contractStartDate = new Date(parsed.data.contractStartDate);
-    }
-    if (parsed.data.contractEndDate) {
-      data.contractEndDate = new Date(parsed.data.contractEndDate);
-    }
     if (parsed.data.status) {
       data.status = parsed.data.status;
     }

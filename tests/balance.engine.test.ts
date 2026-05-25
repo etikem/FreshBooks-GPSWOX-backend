@@ -6,15 +6,12 @@ import { decideAccess } from '../src/services/balance.engine';
  * for the rule precedence.
  */
 
-// Helpers
-const FAR_FUTURE_CONTRACT_END = new Date('2099-12-31T00:00:00Z');
 const NOW = new Date('2026-05-12T12:00:00Z');
 
 describe('decideAccess — unlimited bypass', () => {
   it('unlimited account is ACTIVE with no expiration even with no payment', () => {
     const d = decideAccess({
       isUnlimited: true,
-      contractEndDate: FAR_FUTURE_CONTRACT_END,
       latestPaymentAt: null,
       now: NOW,
     });
@@ -27,7 +24,6 @@ describe('decideAccess — unlimited bypass', () => {
   it('unlimited bypass wins over an expired payment', () => {
     const d = decideAccess({
       isUnlimited: true,
-      contractEndDate: FAR_FUTURE_CONTRACT_END,
       // Payment from 6 months ago — would normally be BLOCKED.
       latestPaymentAt: new Date('2025-11-01T00:00:00Z'),
       now: NOW,
@@ -36,24 +32,12 @@ describe('decideAccess — unlimited bypass', () => {
     expect(d.isUnlimited).toBe(true);
     expect(d.effectiveAccessExpiresAt).toBeNull();
   });
-
-  it('unlimited bypass wins over an elapsed contract end', () => {
-    const d = decideAccess({
-      isUnlimited: true,
-      contractEndDate: new Date('2025-01-01T00:00:00Z'), // already past
-      latestPaymentAt: null,
-      now: NOW,
-    });
-    expect(d.shouldRestore).toBe(true);
-    expect(d.isUnlimited).toBe(true);
-  });
 });
 
 describe('decideAccess — no payment on record', () => {
   it('BLOCKS a brand-new client with no payment history', () => {
     const d = decideAccess({
       isUnlimited: false,
-      contractEndDate: FAR_FUTURE_CONTRACT_END,
       latestPaymentAt: null,
       now: NOW,
     });
@@ -68,7 +52,6 @@ describe('decideAccess — payment → next-month 10th', () => {
   it('payment on Apr 2 → access through May 10 08:00 UTC', () => {
     const d = decideAccess({
       isUnlimited: false,
-      contractEndDate: FAR_FUTURE_CONTRACT_END,
       latestPaymentAt: new Date('2026-04-02T00:00:00Z'),
       now: new Date('2026-04-05T00:00:00Z'),
     });
@@ -79,7 +62,6 @@ describe('decideAccess — payment → next-month 10th', () => {
   it('payment on Apr 12 → access through May 10 08:00 UTC (matches business example)', () => {
     const d = decideAccess({
       isUnlimited: false,
-      contractEndDate: FAR_FUTURE_CONTRACT_END,
       latestPaymentAt: new Date('2026-04-12T00:00:00Z'),
       now: new Date('2026-04-15T00:00:00Z'),
     });
@@ -90,7 +72,6 @@ describe('decideAccess — payment → next-month 10th', () => {
   it('payment on May 30 → access through Jun 10 08:00 UTC (only 11 days of access)', () => {
     const d = decideAccess({
       isUnlimited: false,
-      contractEndDate: FAR_FUTURE_CONTRACT_END,
       latestPaymentAt: new Date('2026-05-30T00:00:00Z'),
       now: new Date('2026-05-31T00:00:00Z'),
     });
@@ -104,7 +85,6 @@ describe('decideAccess — grace period boundary', () => {
     // Payment in April → expiration May 10 08:00. At May 10 07:59 still ACTIVE.
     const d = decideAccess({
       isUnlimited: false,
-      contractEndDate: FAR_FUTURE_CONTRACT_END,
       latestPaymentAt: new Date('2026-04-12T00:00:00Z'),
       now: new Date('2026-05-10T07:59:00Z'),
     });
@@ -114,7 +94,6 @@ describe('decideAccess — grace period boundary', () => {
   it('blocked once expiration moment passes', () => {
     const d = decideAccess({
       isUnlimited: false,
-      contractEndDate: FAR_FUTURE_CONTRACT_END,
       latestPaymentAt: new Date('2026-04-12T00:00:00Z'),
       now: new Date('2026-05-10T08:00:00Z'),
     });
@@ -126,48 +105,10 @@ describe('decideAccess — grace period boundary', () => {
   it('blocked after the 10th when no fresh payment landed', () => {
     const d = decideAccess({
       isUnlimited: false,
-      contractEndDate: FAR_FUTURE_CONTRACT_END,
       latestPaymentAt: new Date('2026-04-12T00:00:00Z'),
       now: new Date('2026-05-11T00:00:00Z'),
     });
     expect(d.shouldRestore).toBe(false);
-  });
-});
-
-describe('decideAccess — contract end clamp', () => {
-  it('clamps to contract end when computed expiration would exceed it', () => {
-    // Payment in May 2026 → would normally give until Jun 10 2026.
-    // Contract ends mid-May 2026 → expiration must clamp to contract end.
-    const contractEnd = new Date('2026-05-20T00:00:00Z');
-    const d = decideAccess({
-      isUnlimited: false,
-      contractEndDate: contractEnd,
-      latestPaymentAt: new Date('2026-05-05T00:00:00Z'),
-      now: new Date('2026-05-06T00:00:00Z'),
-    });
-    expect(d.shouldRestore).toBe(true);
-    expect(d.effectiveAccessExpiresAt?.toISOString()).toBe(contractEnd.toISOString());
-  });
-
-  it('blocks when contract end is in the past, even with a valid payment', () => {
-    const d = decideAccess({
-      isUnlimited: false,
-      contractEndDate: new Date('2025-01-01T00:00:00Z'),
-      latestPaymentAt: new Date('2026-04-12T00:00:00Z'),
-      now: new Date('2026-04-15T00:00:00Z'),
-    });
-    expect(d.shouldRestore).toBe(false);
-  });
-
-  it('does NOT clamp when computed expiration is before contract end', () => {
-    const d = decideAccess({
-      isUnlimited: false,
-      contractEndDate: new Date('2027-01-01T00:00:00Z'),
-      latestPaymentAt: new Date('2026-04-12T00:00:00Z'),
-      now: new Date('2026-04-15T00:00:00Z'),
-    });
-    expect(d.shouldRestore).toBe(true);
-    expect(d.effectiveAccessExpiresAt?.toISOString()).toBe('2026-05-10T08:00:00.000Z');
   });
 });
 
@@ -178,7 +119,6 @@ describe('decideAccess — caller passes the latest payment', () => {
     // whatever it's given.
     const d = decideAccess({
       isUnlimited: false,
-      contractEndDate: FAR_FUTURE_CONTRACT_END,
       latestPaymentAt: new Date('2026-03-15T00:00:00Z'), // post-reversal
       now: new Date('2026-05-12T00:00:00Z'),
     });
@@ -189,7 +129,6 @@ describe('decideAccess — caller passes the latest payment', () => {
   it('uses the latest payment when given (multiple payments → caller picks)', () => {
     const d = decideAccess({
       isUnlimited: false,
-      contractEndDate: FAR_FUTURE_CONTRACT_END,
       latestPaymentAt: new Date('2026-05-07T00:00:00Z'),
       now: new Date('2026-05-08T00:00:00Z'),
     });

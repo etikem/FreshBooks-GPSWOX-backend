@@ -11,9 +11,8 @@ import type { AccessDecision } from '../types';
  *   1. Unlimited bypass. If `client.isUnlimited === true` the client is
  *      ACTIVE with NO ABC Track expiration (we send
  *      `enable_expiration_date=0`). Billing automation is skipped
- *      entirely — outstanding invoices, missing payments, expired
- *      contract dates are all ignored. Unlimited accounts are managed
- *      outside billing.
+ *      entirely — outstanding invoices and missing payments are
+ *      ignored. Unlimited accounts are managed outside billing.
  *
  *   2. No payment → BLOCK. If we have no record of a successful
  *      payment, access is denied. Brand-new clients sit in this state
@@ -24,22 +23,18 @@ import type { AccessDecision } from '../types';
  *      M grants access through the 10th of month M+1, regardless of when
  *      in M it landed. See utils/expiration.ts.
  *
- *   4. Contract end clamp. Never push an expiration past
- *      `contractEndDate`. If the computed date exceeds the contract end,
- *      use the contract end.
- *
- *   5. If the computed expiration is already in the past, BLOCK. (This
+ *   4. If the computed expiration is already in the past, BLOCK. (This
  *      is how the monthly grace period rolls over: a payment from
  *      April → access until May 10 08:00 UTC; if no new payment arrives
  *      before then, the cron sweep finds this client on May 10 and
  *      blocks.)
  *
- * Invoice balances, paid-through dates, credit memos: irrelevant.
+ * Invoice balances, paid-through dates, credit memos, contract dates:
+ * irrelevant.
  */
 
 export interface AccessDecisionInput {
   isUnlimited: boolean;
-  contractEndDate: Date;
   // Latest successful payment we have on record (max PaymentLog.paidAt).
   // Null when the client has no payment history.
   latestPaymentAt: Date | null;
@@ -69,11 +64,7 @@ export function decideAccess(input: AccessDecisionInput): AccessDecision {
     };
   }
 
-  const snapped = nextMonthTenthAtEightUtc(input.latestPaymentAt);
-  const effective =
-    snapped.getTime() > input.contractEndDate.getTime()
-      ? input.contractEndDate
-      : snapped;
+  const effective = nextMonthTenthAtEightUtc(input.latestPaymentAt);
 
   if (effective.getTime() <= now.getTime()) {
     return {
