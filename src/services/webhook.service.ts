@@ -436,19 +436,13 @@ export async function processWebhookEvent(webhookEventId: string): Promise<void>
       return;
     }
 
-    // Push the FreshBooks email + phone onto the ABC Track record so the
-    // GPS account stays aligned with whatever the operator just changed.
-    // Skipped for newly auto-created users — createUser already set the
-    // full profile, and a redundant fetchAndUpdate here would overwrite
-    // the expiration date with unlimited if the GET response lacks it.
-    if (client.gpswoxUserId && !autoCreated) {
-      await syncAbctrackProfile(client).catch((e) =>
-        logger.warn(
-          { err: e?.message, clientId: client!.id },
-          'abctrack.sync-profile.failed',
-        ),
-      );
-    }
+    // Profile sync to ABC Track has been intentionally removed. Per the
+    // operating rules, ABC Track is only written in three cases:
+    //   1. client.create — full profile + initial state via createUser
+    //      (handled by tryAutoMapGpswoxUser above).
+    //   2. payment.* — expiration date only (via evaluateAndApply below).
+    //   3. client.delete — active=0 (handled above before this point).
+    // No other event may push fields to ABC Track.
 
     // Record the payment event before we re-evaluate. Form-encoded
     // payment webhooks don't carry amount/date/etc., so prefer the payment
@@ -469,13 +463,34 @@ export async function processWebhookEvent(webhookEventId: string): Promise<void>
       );
     }
 
-    // Newly auto-created AT users on client.create events already have
-    // active=1 + expiration=10th-of-next-month set by createUser. Skip
-    // evaluateAndApply so the BLOCK path (no payment yet) doesn't
-    // immediately overwrite that expiration with "now".
-    // For payment/invoice events, always run the full evaluation so any
-    // payment received is reflected immediately.
-    if (autoCreated && !isPaymentEvent && !isInvoiceEvent) {
+    // Decision branching — the only event that touches ABC Track here
+    // is payment.*, which calls evaluateAndApply to update the expiration
+    // date. Everything else is local-only.
+    if (isPaymentEvent) {
+      await evaluateAndApply({
+        clientId: client.id,
+        trigger: 'WEBHOOK',
+        webhookEventId: ev.id,
+      });
+    } else if (isInvoiceEvent) {
+      // Invoice events: refresh the local cache for the dashboard. No
+      // ABC Track call. The monthly recurring-invoice create FreshBooks
+      // fires on the 25th must never touch access state.
+      try {
+        const invoices = await freshbooksService.listInvoicesForClient(
+          client.freshbooksClientId,
+        );
+        await refreshInvoiceCache(client.id, invoices);
+      } catch (e) {
+        logger.warn(
+          { err: (e as Error).message, clientId: client.id },
+          'invoice-cache.refresh.failed',
+        );
+      }
+    } else if (autoCreated) {
+      // Newly auto-created ABC Track user (from a client.create) already
+      // has the full profile + initial expiration set by createUser. Just
+      // log the decision; do not re-evaluate.
       await prisma.actionLog.create({
         data: {
           clientId: client.id,
@@ -484,13 +499,9 @@ export async function processWebhookEvent(webhookEventId: string): Promise<void>
           details: { effectiveAccessExpiresAt: client.accessExpiresAt?.toISOString() ?? null },
         },
       });
-    } else {
-      await evaluateAndApply({
-        clientId: client.id,
-        trigger: 'WEBHOOK',
-        webhookEventId: ev.id,
-      });
     }
+    // client.update / client.create for already-mapped clients / any other
+    // event type: no-op. No ABC Track write, no access re-evaluation.
 
     await markProcessed(ev.id);
   } catch (err) {
@@ -591,54 +602,6 @@ async function deletePaymentLog(
     where: { clientId, freshbooksPaymentId },
   });
   await refreshLastPaymentAt(clientId);
-}
-
-/**
- * Push the current FreshBooks profile onto the mapped ABC Track record.
- * Used by every non-delete webhook so the GPS account stays in sync with
- * whatever the operator just edited in FreshBooks. Mirrors the field set
- * the manual ABC Track admin UI sends on save:
- *
- *   - email, phone_number (top-level)
- *   - client[first_name], client[last_name], client[address], client[comment]
- *   - client[personal_code] = FreshBooks client id (cross-system linkage)
- *
- * Phone preference: mobile → business → home. Empty string clears the
- * field on ABC Track when nothing is on file.
- *
- * Skips the placeholder email we save when FreshBooks sends a profile
- * with no email at all — pushing `freshbooks-<id>@no-email.local` onto
- * ABC Track would be worse than leaving the existing email in place.
- */
-async function syncAbctrackProfile(
-  client: NonNullable<Awaited<ReturnType<typeof clientMappingService.findByFreshbooksClientId>>>,
-): Promise<void> {
-  if (!client.gpswoxUserId) return;
-  if (client.email.endsWith('@no-email.local')) return;
-  const phoneNumber =
-    client.mobilePhone ?? client.businessPhone ?? client.homePhone ?? null;
-  const address = [
-    client.addressStreet,
-    client.addressStreet2,
-    [client.addressCity, client.addressProvince, client.addressCode]
-      .filter(Boolean)
-      .join(', '),
-    client.addressCountry,
-  ]
-    .filter((v) => typeof v === 'string' && v.length > 0)
-    .join('\n');
-
-  await abctrackService.syncProfile({
-    clientId: client.id,
-    gpswoxUserId: client.gpswoxUserId,
-    email: client.email,
-    phoneNumber,
-    firstName: client.firstName,
-    lastName: client.lastName,
-    address: address || null,
-    notes: client.notes,
-    personalCode: client.freshbooksClientId,
-  });
 }
 
 /**
@@ -1041,14 +1004,12 @@ export async function evaluateAndApply(args: {
         },
       });
     } else {
-      // BLOCK path. Disable the ABC Track user if not already blocked.
-      if (client.gpswoxUserId && client.status !== 'BLOCKED') {
-        await applyDisable({
-          clientId: client.id,
-          gpswoxUserId: client.gpswoxUserId,
-          email: client.email,
-        });
-      }
+      // BLOCK path — local-only. ABC Track is never auto-disabled by the
+      // billing pipeline. Per the operating rules, ABC Track expiration
+      // is written once when a payment arrives; when that date passes,
+      // ABC Track expires the user on its own without our involvement.
+      // The only ABC Track deactivation is from client.delete, handled
+      // separately above.
       await prisma.client.update({
         where: { id: client.id },
         data: {
@@ -1112,28 +1073,6 @@ async function applyEnable(args: {
           email: args.email,
         },
         idempotencyKey: `enable:${args.clientId}:${expirationLabel}`,
-        initialError: err.message,
-      });
-      return;
-    }
-    throw err;
-  }
-}
-
-async function applyDisable(args: {
-  clientId: string;
-  gpswoxUserId: string;
-  email: string | null;
-}): Promise<void> {
-  try {
-    await abctrackService.disable(args);
-  } catch (err) {
-    if (err instanceof TransientHttpError) {
-      await enqueueRetry({
-        clientId: args.clientId,
-        operation: 'gpswox.disable',
-        payload: { gpswoxUserId: args.gpswoxUserId, email: args.email },
-        idempotencyKey: `disable:${args.clientId}`,
         initialError: err.message,
       });
       return;

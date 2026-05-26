@@ -1,15 +1,15 @@
 import { prisma } from '../db/prisma';
 import { logger } from '../utils/logger';
-import { evaluateAndApply } from './webhook.service';
 
 /**
  * Daily / hourly sweep for clients whose access window has elapsed.
  *
- * Why: webhooks fire on FreshBooks state changes. If a client's payment
- * coverage lapses without a new payment event, no webhook fires and the
- * client stays ACTIVE in our DB even though their next-month-10th
- * deadline has passed. This sweep re-evaluates them so the access engine
- * blocks them on schedule.
+ * Local-only. ABC Track expiration is written once, at the moment a
+ * payment arrives, to the 10th of the following month. When that date
+ * passes, ABC Track auto-expires the user on its own — we do NOT need
+ * to push another update. This sweep exists only to keep our own
+ * `Client.status` field in sync with reality so the admin dashboard's
+ * BLOCKED filter is accurate.
  *
  * Selection criteria:
  *   - status = ACTIVE
@@ -19,14 +19,11 @@ import { evaluateAndApply } from './webhook.service';
  * Unlimited clients are explicitly excluded — they have no expiration
  * and should never be auto-blocked by this sweep.
  *
- * We chunk through clients in batches and call `evaluateAndApply`, which
- * applies the payment-driven rules. Errors on individual clients don't
- * abort the sweep.
+ * Errors on individual clients don't abort the sweep.
  */
 export async function runCronSweepOnce(now: Date = new Date()): Promise<{
   examined: number;
   blocked: number;
-  restored: number;
   errors: number;
 }> {
   const due = await prisma.client.findMany({
@@ -35,29 +32,49 @@ export async function runCronSweepOnce(now: Date = new Date()): Promise<{
       isUnlimited: false,
       accessExpiresAt: { lt: now },
     },
-    select: { id: true, email: true },
+    select: { id: true, tenantId: true, email: true },
     take: 500,
   });
   if (due.length === 0) {
-    return { examined: 0, blocked: 0, restored: 0, errors: 0 };
+    return { examined: 0, blocked: 0, errors: 0 };
   }
 
   logger.info({ n: due.length }, 'cron.sweep.start');
 
   let blocked = 0;
-  let restored = 0;
   let errors = 0;
 
   for (const c of due) {
     try {
-      await evaluateAndApply({ clientId: c.id, trigger: 'CRON' });
-      // Read back the new status to count outcomes for the operator log.
-      const after = await prisma.client.findUnique({
-        where: { id: c.id },
-        select: { status: true },
-      });
-      if (after?.status === 'BLOCKED') blocked += 1;
-      else if (after?.status === 'ACTIVE') restored += 1;
+      await prisma.$transaction([
+        prisma.client.update({
+          where: { id: c.id },
+          data: {
+            status: 'BLOCKED',
+            accessExpiresAt: null,
+            lastSyncedAt: now,
+          },
+        }),
+        prisma.actionLog.create({
+          data: {
+            clientId: c.id,
+            kind: 'DECISION_BLOCK',
+            message:
+              'Access window elapsed — local status updated to BLOCKED. ABC Track expiration was written on the last payment and expires the user on its own; no ABC Track call made.',
+          },
+        }),
+        prisma.syncRun.create({
+          data: {
+            tenantId: c.tenantId,
+            clientId: c.id,
+            trigger: 'CRON',
+            outcome: 'BLOCKED',
+            finishedAt: now,
+            notes: 'Local-only status update. ABC Track unaffected.',
+          },
+        }),
+      ]);
+      blocked += 1;
     } catch (err) {
       errors += 1;
       logger.warn(
@@ -68,8 +85,8 @@ export async function runCronSweepOnce(now: Date = new Date()): Promise<{
   }
 
   logger.info(
-    { examined: due.length, blocked, restored, errors },
+    { examined: due.length, blocked, errors },
     'cron.sweep.done',
   );
-  return { examined: due.length, blocked, restored, errors };
+  return { examined: due.length, blocked, errors };
 }
