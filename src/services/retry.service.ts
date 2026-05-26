@@ -144,11 +144,16 @@ async function runJob(
       });
       return;
     case 'gpswox.disable':
-      await abctrackService.disable({
-        clientId: ctx.clientId,
-        gpswoxUserId: String(payload.gpswoxUserId),
-        email,
-      });
+      // Intentional no-op. Auto-disabling a client in ABC Track is no
+      // longer part of the system's behavior — ABC Track is only
+      // written on payment (expiration), client.create (full profile),
+      // and client.delete (active=0). This case remains only to drain
+      // stale jobs from the queue that were enqueued before the rule
+      // change. New code never enqueues `gpswox.disable`.
+      logger.info(
+        { clientId: ctx.clientId, gpswoxUserId: payload.gpswoxUserId },
+        'retry.gpswox.disable.skipped-deprecated',
+      );
       return;
     case 'gpswox.updateExpiration':
       await abctrackService.updateExpiration({
@@ -180,6 +185,33 @@ export async function cancel(jobId: string): Promise<void> {
     where: { id: jobId },
     data: { status: 'CANCELLED' },
   });
+}
+
+/**
+ * One-shot startup cleanup. Cancels any PENDING `gpswox.disable` retry
+ * jobs left over from before auto-disable was removed. Without this, a
+ * stale queued job would still call `abctrackService.disable()` and
+ * suspend an account when the worker drains the queue.
+ *
+ * Idempotent — safe to call on every worker boot. Returns the count of
+ * jobs cancelled.
+ */
+export async function cancelDeprecatedDisableJobs(): Promise<number> {
+  const result = await prisma.retryJob.updateMany({
+    where: { operation: 'gpswox.disable', status: 'PENDING' },
+    data: {
+      status: 'CANCELLED',
+      lastError:
+        'Cancelled at boot — gpswox.disable is no longer a valid operation. ABC Track auto-disable was removed.',
+    },
+  });
+  if (result.count > 0) {
+    logger.warn(
+      { count: result.count },
+      'retry.gpswox.disable.cancelled-stale',
+    );
+  }
+  return result.count;
 }
 
 export { RetryStatus };

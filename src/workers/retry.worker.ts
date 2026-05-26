@@ -1,6 +1,6 @@
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
-import { pollAndRunOnce } from '../services/retry.service';
+import { pollAndRunOnce, cancelDeprecatedDisableJobs } from '../services/retry.service';
 import { runCronSweepOnce } from '../services/cron-sweep.service';
 import { runNotificationCleanupOnce } from '../services/notification-cleanup.service';
 import { prisma } from '../db/prisma';
@@ -89,10 +89,18 @@ process.on('SIGINT', () => void shutdown('SIGINT'));
 
 prisma
   .$connect()
-  .then(() => {
+  .then(async () => {
     logger.info(
       { cronSweepIntervalMs: env.CRON_SWEEP_INTERVAL_MS },
       'retry.worker.started',
+    );
+    // Drain any stale gpswox.disable jobs left over from before
+    // auto-disable was removed, so they can't run and suspend a user.
+    await cancelDeprecatedDisableJobs().catch((err) =>
+      logger.warn(
+        { err: (err as Error).message },
+        'retry.cancel-deprecated-disable.failed',
+      ),
     );
     return loop();
   })
