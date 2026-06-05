@@ -16,6 +16,8 @@ import {
   replayRetry,
   cancelRetry,
   getNotifications,
+  getReconciliation,
+  refreshReconciliation,
 } from '../controllers/admin.controller';
 
 export const adminRouter = Router();
@@ -37,6 +39,9 @@ adminRouter.get('/clients', listClients);
 adminRouter.get('/clients/:id', getClientDetail);
 adminRouter.patch('/clients/:id', patchClient);
 adminRouter.post('/clients/:id/sync', triggerManualSync);
+
+adminRouter.get('/reconciliation', getReconciliation);
+adminRouter.post('/reconciliation/refresh', refreshReconciliation);
 
 adminRouter.get('/logs/actions', listActionLogs);
 adminRouter.get('/logs/webhooks', listWebhookEvents);

@@ -6,6 +6,10 @@ import { prisma } from '../db/prisma';
 import { env } from '../config/env';
 import { evaluateAndApply, processWebhookEvent } from '../services/webhook.service';
 import { manualReplay, cancel } from '../services/retry.service';
+import {
+  getReconciliationSnapshot,
+  triggerReconciliation,
+} from '../services/reconciliation.service';
 import { logger } from '../utils/logger';
 
 // ── auth ─────────────────────────────────────────────────────────────
@@ -309,6 +313,33 @@ export async function getNotifications(
     failedRetries:    { count: failedRetryCount,    sample: failedRetrySample },
     recentSyncErrors: { count: syncErrorCount,      sample: syncErrorSample },
   });
+}
+
+// ── reconciliation (ABC Track ↔ FreshBooks discrepancy report) ──────
+/**
+ * Return the latest reconciliation snapshot. The sweep is expensive, so we
+ * never block the request on it: if no sweep has ever run we kick one off in
+ * the background and return `status: 'running'`; the frontend polls until
+ * `status` flips to `ready`/`error`.
+ */
+export async function getReconciliation(
+  _req: Request,
+  res: Response,
+): Promise<void> {
+  const snap = getReconciliationSnapshot();
+  if (snap.status === 'idle') {
+    res.json(triggerReconciliation());
+    return;
+  }
+  res.json(snap);
+}
+
+/** Force a fresh sweep (no-op if one is already in flight). */
+export async function refreshReconciliation(
+  _req: Request,
+  res: Response,
+): Promise<void> {
+  res.json(triggerReconciliation());
 }
 
 // ── logs ────────────────────────────────────────────────────────────

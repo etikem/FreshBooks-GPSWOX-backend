@@ -246,7 +246,9 @@ export class FreshBooksService {
             per_page: perPage,
             page,
             // Include lines/payments so the balance is authoritative.
-            include: 'lines,payments',
+            // FreshBooks requires the array form `include[]=lines` — the
+            // comma/string form is silently ignored and returns zero lines.
+            include: ['lines', 'payments'],
           },
         });
       } catch (err) {
@@ -271,6 +273,174 @@ export class FreshBooksService {
       'freshbooks.invoices.fetched',
     );
     return all;
+  }
+
+  /**
+   * Look a client up by email. FreshBooks supports a server-side
+   * `search[email]` filter so we don't have to page the whole roster.
+   *
+   * The filter can match loosely, so we narrow to an exact (case-insensitive)
+   * email match before declaring a client "present". Returns the matched raw
+   * client (or null) plus the raw `total` the API reported — the reconciliation
+   * sweep treats "no exact match" as missing-from-FreshBooks.
+   */
+  async findClientByEmail(
+    email: string,
+  ): Promise<{ client: Record<string, unknown> | null; total: number }> {
+    const { clients, total } = await this.findClientsByEmail(email);
+    return { client: clients[0] ?? null, total };
+  }
+
+  /**
+   * Like `findClientByEmail`, but returns EVERY non-deleted FreshBooks client
+   * whose email exactly matches — FreshBooks allows two distinct clients to
+   * share one email (e.g. a personal client and an organization). The
+   * reconciliation sweep must sum the device billing across all of them,
+   * otherwise it sees only one client's invoice and reports a false mismatch.
+   *
+   * Soft-deleted clients (vis_state === 1) are excluded so their stale
+   * invoices don't inflate the billed quantity.
+   */
+  async findClientsByEmail(
+    email: string,
+  ): Promise<{ clients: Record<string, unknown>[]; total: number }> {
+    const norm = email.trim().toLowerCase();
+    if (!norm) return { clients: [], total: 0 };
+    const url = `/accounting/account/${this.accountId}/users/clients`;
+    let res;
+    try {
+      res = await this.http.get(url, {
+        params: { 'search[email]': norm, per_page: 100, page: 1 },
+      });
+    } catch (err) {
+      throw rewriteAuthError(err);
+    }
+    const result = res.data?.response?.result ?? res.data?.response ?? res.data;
+    const raw = (result?.clients ?? []) as Record<string, unknown>[];
+    const total = Number(result?.total ?? raw.length);
+    const clients = raw.filter(
+      (c) =>
+        String(c.email ?? '').trim().toLowerCase() === norm &&
+        Number(c.vis_state ?? 0) !== 1,
+    );
+    return { clients, total };
+  }
+
+  /**
+   * Compute the device billing quantity for a client: the sum of the qty of
+   * every line named `RECONCILE_DEVICE_LINE_NAME` on the client's most recent
+   * (non-deleted) invoice. We use the latest invoice rather than summing
+   * across months because each monthly invoice repeats the same device line —
+   * the latest one reflects what's currently billed.
+   *
+   * Returns `hasInvoices: false` (qty 0) when the client has no live invoices.
+   */
+  async getDeviceBillingForClient(freshbooksClientId: string): Promise<{
+    qty: number;
+    hasInvoices: boolean;
+    invoiceId: string | null;
+    invoiceNumber: string | null;
+    invoiceDate: string | null;
+  }> {
+    const url = `/accounting/account/${this.accountId}/invoices/invoices`;
+    let res;
+    try {
+      res = await this.http.get(url, {
+        params: {
+          'search[customerid]': freshbooksClientId,
+          per_page: 100,
+          page: 1,
+          // Array form is required — `include=lines` is ignored by FreshBooks
+          // and yields zero lines, which silently zeroes the device qty.
+          include: ['lines'],
+        },
+      });
+    } catch (err) {
+      throw rewriteAuthError(err);
+    }
+    const result = res.data?.response?.result ?? res.data?.response ?? res.data;
+    const invoices = (result?.invoices ?? []) as Record<string, unknown>[];
+    // Drop soft-deleted invoices (vis_state === 1) before picking the latest.
+    const live = invoices.filter((i) => Number(i.vis_state ?? 0) !== 1);
+    if (live.length === 0) {
+      return {
+        qty: 0,
+        hasInvoices: false,
+        invoiceId: null,
+        invoiceNumber: null,
+        invoiceDate: null,
+      };
+    }
+    live.sort((a, b) => invoiceTime(b) - invoiceTime(a));
+    const latest = live[0]!; // guaranteed: we returned above when live is empty
+    const target = env.RECONCILE_DEVICE_LINE_NAME.trim().toLowerCase();
+    const lines = (latest.lines ?? []) as Record<string, unknown>[];
+    let qty = 0;
+    for (const ln of lines) {
+      if (String(ln.name ?? '').trim().toLowerCase() === target) {
+        const n = Number(ln.qty ?? 0);
+        if (Number.isFinite(n)) qty += n;
+      }
+    }
+    return {
+      qty,
+      hasInvoices: true,
+      invoiceId: String(latest.id ?? latest.invoiceid ?? ''),
+      invoiceNumber: (latest.invoice_number ?? null) as string | null,
+      invoiceDate: (latest.create_date ?? latest.created_at ?? latest.date ?? null) as
+        | string
+        | null,
+    };
+  }
+
+  /**
+   * Sum the device billing across several FreshBooks clients — used when more
+   * than one client shares an email. Each client is billed on its own
+   * recurring invoice, so the true device count for that email is the sum of
+   * every client's latest-invoice quantity.
+   *
+   * Returns the combined qty plus a per-client breakdown, and surfaces the
+   * single most recent invoice across all clients for display.
+   */
+  async getDeviceBillingForClients(freshbooksClientIds: string[]): Promise<{
+    qty: number;
+    hasInvoices: boolean;
+    invoiceNumber: string | null;
+    invoiceDate: string | null;
+    perClient: Array<{
+      freshbooksClientId: string;
+      qty: number;
+      hasInvoices: boolean;
+      invoiceNumber: string | null;
+      invoiceDate: string | null;
+    }>;
+  }> {
+    const perClient = [];
+    let qty = 0;
+    let hasInvoices = false;
+    for (const id of freshbooksClientIds) {
+      const b = await this.getDeviceBillingForClient(id);
+      qty += b.qty;
+      hasInvoices = hasInvoices || b.hasInvoices;
+      perClient.push({
+        freshbooksClientId: id,
+        qty: b.qty,
+        hasInvoices: b.hasInvoices,
+        invoiceNumber: b.invoiceNumber,
+        invoiceDate: b.invoiceDate,
+      });
+    }
+    // Representative invoice = the most recent one across all clients.
+    const latest = perClient
+      .filter((p) => p.invoiceDate)
+      .sort((a, b) => Date.parse(b.invoiceDate!) - Date.parse(a.invoiceDate!))[0];
+    return {
+      qty,
+      hasInvoices,
+      invoiceNumber: latest?.invoiceNumber ?? null,
+      invoiceDate: latest?.invoiceDate ?? null,
+      perClient,
+    };
   }
 
   /**
@@ -331,6 +501,13 @@ function parseDate(value: unknown): Date | null {
   if (!value || typeof value !== 'string') return null;
   const d = new Date(value);
   return isNaN(d.getTime()) ? null : d;
+}
+
+/** Sortable timestamp for an invoice row; 0 when no parseable date exists. */
+function invoiceTime(i: Record<string, unknown>): number {
+  const s = (i.create_date ?? i.created_at ?? i.date) as string | undefined;
+  const t = s ? Date.parse(s) : NaN;
+  return Number.isNaN(t) ? 0 : t;
 }
 
 // Singleton — one HTTP client across the process is intentional.

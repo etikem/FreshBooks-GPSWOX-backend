@@ -29,6 +29,29 @@ export interface AbctrackClientSummary {
   subscription_expiration: string;
 }
 
+/**
+ * Fuller view of an Abctrack admin client listing row — the fields the
+ * reconciliation sweep consumes. `devices_count` is the number of vehicles
+ * assigned to the client (compared against the FreshBooks billed quantity);
+ * `client_id` is the inner client-record id (distinct from the user `id`).
+ */
+export interface AbctrackClientRow {
+  id: number;
+  active: number;
+  email: string;
+  phone_number: string | null;
+  devices_count: number;
+  client_id: number | null;
+}
+
+/** First/last name + contact fields from the per-client form payload. */
+export interface AbctrackClientFormDetail {
+  firstName: string;
+  lastName: string;
+  email: string;
+  phoneNumber: string;
+}
+
 interface CacheEntry {
   value: AbctrackClientSummary | null;
   expiresAt: number;
@@ -733,6 +756,89 @@ class AbctrackService {
       'abctrack.findByEmail.done',
     );
     return firstHit;
+  }
+
+  /**
+   * Page through the entire admin client listing and return every row with
+   * the fields the reconciliation sweep needs. Unlike `findUserByEmail` this
+   * is an unfiltered crawl — used to enumerate the full ABC Track population
+   * so we can diff it against FreshBooks. Honours the same page cap as the
+   * email lookup to bound a runaway crawl.
+   */
+  async listAllClients(): Promise<AbctrackClientRow[]> {
+    const perPage = env.ABCTRACK_LIST_PER_PAGE;
+    const maxPages = env.ABCTRACK_LIST_MAX_PAGES;
+    const all: AbctrackClientRow[] = [];
+    let page = 1;
+
+    while (page <= maxPages) {
+      const res = await abctrackRequest<AbctrackListEnvelope>({
+        method: 'GET',
+        url: env.ABCTRACK_ENDPOINT_CLIENT_LIST,
+        params: {
+          page,
+          per_page: perPage,
+          sort: 'asc',
+          sort_by: 'email',
+        },
+      });
+      const inner = res.data?.data?.data;
+      const rows = (Array.isArray(inner?.data) ? inner!.data : []) as unknown as Record<
+        string,
+        unknown
+      >[];
+      for (const r of rows) {
+        const id = Number(r.id);
+        if (!Number.isFinite(id)) continue;
+        all.push({
+          id,
+          active: Number(r.active ?? 0),
+          email: String(r.email ?? '').trim(),
+          phone_number: (r.phone_number ?? null) as string | null,
+          devices_count: Number(r.devices_count ?? 0),
+          client_id: r.client_id != null ? Number(r.client_id) : null,
+        });
+      }
+
+      const lastPage = Number(inner?.last_page ?? page);
+      if (page >= lastPage || rows.length === 0) break;
+      page += 1;
+    }
+
+    if (page > maxPages) {
+      logger.warn({ maxPages, perPage, count: all.length }, 'abctrack.listAll.page-cap-reached');
+    }
+    logger.info({ count: all.length }, 'abctrack.listAll.done');
+    return all;
+  }
+
+  /**
+   * Fetch the per-client form payload and pull out the human-readable
+   * profile fields (first/last name, email, phone). The listing rows don't
+   * carry the name, so the reconciliation sweep calls this only for the
+   * small subset of clients that are missing from FreshBooks. Returns null
+   * if the payload can't be read.
+   *
+   * Response shape: `{ data: { data: { client: { first_name, last_name },
+   * email, phone_number, ... } } }` — the inner `data` is the form model.
+   */
+  async getClientFormDetail(id: number): Promise<AbctrackClientFormDetail | null> {
+    const res = await abctrackRequest<unknown>({
+      method: 'GET',
+      url: `${env.ABCTRACK_ENDPOINT_CLIENT_FORM}/${id}`,
+    });
+    const model = (res.data as { data?: { data?: Record<string, unknown> } })?.data?.data;
+    if (!model || typeof model !== 'object') return null;
+    const client =
+      model.client && typeof model.client === 'object'
+        ? (model.client as Record<string, unknown>)
+        : {};
+    return {
+      firstName: String(client.first_name ?? '').trim(),
+      lastName: String(client.last_name ?? '').trim(),
+      email: String(model.email ?? '').trim(),
+      phoneNumber: String(model.phone_number ?? '').trim(),
+    };
   }
 
   /**

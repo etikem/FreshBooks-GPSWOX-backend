@@ -152,6 +152,13 @@ const schema = z.object({
     .string()
     .min(1)
     .default('/ui/payload/table/admin/client/client'),
+  // Per-client form payload — GET /{id} returns first_name/last_name/email/
+  // phone_number for a single client. Used by the reconciliation sweep to
+  // enrich "missing in FreshBooks" rows the listing doesn't carry by name.
+  ABCTRACK_ENDPOINT_CLIENT_FORM: z
+    .string()
+    .min(1)
+    .default('/ui/admin/form/client/client'),
   ABCTRACK_LIST_PER_PAGE: z.coerce.number().int().positive().max(500).default(100),
   ABCTRACK_LIST_MAX_PAGES: z.coerce.number().int().positive().default(200),
   ABCTRACK_EMAIL_CACHE_TTL_MS: z.coerce.number().int().nonnegative().default(5 * 60_000),
@@ -172,6 +179,16 @@ const schema = z.object({
     .transform((v) => v === 'true' || v === '1')
     .default('true'),
   CRON_SWEEP_INTERVAL_MS: z.coerce.number().int().positive().default(60 * 60 * 1000),
+
+  // ── Reconciliation sweep (ABC Track ↔ FreshBooks discrepancy report) ──
+  // Name of the FreshBooks invoice line item that carries the per-device
+  // billing quantity. The sweep sums the qty of every line whose name
+  // matches this (case-insensitive) on a client's latest invoice and
+  // compares it to ABC Track's devices_count.
+  RECONCILE_DEVICE_LINE_NAME: z.string().min(1).default('GPS Monthly Fee'),
+  // How many ABC Track clients to reconcile against FreshBooks in parallel.
+  // Kept modest so we don't trip FreshBooks rate limits on a full sweep.
+  RECONCILE_CONCURRENCY: z.coerce.number().int().positive().max(20).default(5),
 
   // Retain processed (non-failed) WebhookEvent rows for this many days.
   // Failed rows are NEVER auto-pruned — operators triage them manually.
