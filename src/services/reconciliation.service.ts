@@ -1,7 +1,7 @@
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
 import { abctrackService, type AbctrackClientRow } from './abctrack.service';
-import { freshbooksService } from './freshbooks.service';
+import { freshbooksService, invoiceCustomerId } from './freshbooks.service';
 
 /**
  * Reconciliation sweep — diffs the ABC Track client population against
@@ -129,15 +129,27 @@ type Classified =
   | { kind: 'none' };
 
 /**
- * Classify a single active ABC Track client against FreshBooks:
+ * Prefetched FreshBooks state, built once per sweep so classifying a row makes
+ * ZERO FreshBooks calls. `clientsByEmail` maps a lowercased email to every
+ * matching client (an email can map to several); `invoicesByCustomer` maps a
+ * FreshBooks customer id to its invoice rows (lines included).
+ */
+interface SweepContext {
+  clientsByEmail: Map<string, Record<string, unknown>[]>;
+  invoicesByCustomer: Map<string, Record<string, unknown>[]>;
+}
+
+/**
+ * Classify a single active ABC Track client against the prefetched FreshBooks
+ * snapshot:
  *   - no exact email match in FreshBooks → missing (enrich with form names)
  *   - matched but device counts differ   → mismatch
  *   - matched and counts equal           → none (nothing to surface)
  */
-async function classify(row: AbctrackClientRow): Promise<Classified> {
+async function classify(row: AbctrackClientRow, ctx: SweepContext): Promise<Classified> {
   // A single email can map to more than one FreshBooks client (e.g. a personal
-  // client + an organization). Pull every match and bill them together.
-  const { clients } = await freshbooksService.findClientsByEmail(row.email);
+  // client + an organization). Bill every match together.
+  const clients = ctx.clientsByEmail.get(row.email.trim().toLowerCase()) ?? [];
 
   if (clients.length === 0) {
     let detail = null;
@@ -160,32 +172,52 @@ async function classify(row: AbctrackClientRow): Promise<Classified> {
     };
   }
 
-  const freshbooksClientIds = clients.map((c) => String(c.id ?? c.userid ?? ''));
-  const billing = await freshbooksService.getDeviceBillingForClients(freshbooksClientIds);
+  // Sum the billed device quantity across all matching clients, using the
+  // prefetched invoice rows — no network here.
+  const perClient = clients.map((c) => {
+    const fbId = String(c.id ?? c.userid ?? '');
+    const rows = ctx.invoicesByCustomer.get(fbId) ?? [];
+    const b = freshbooksService.deviceBillingFromRows(rows);
+    return {
+      freshbooksClientId: fbId,
+      name: freshbooksName(c),
+      qty: b.qty,
+      hasInvoices: b.hasInvoices,
+      invoiceNumber: b.invoiceNumber,
+      invoiceDate: b.invoiceDate,
+    };
+  });
+
+  const freshbooksQty = perClient.reduce((sum, p) => sum + p.qty, 0);
+  const hasInvoices = perClient.some((p) => p.hasInvoices);
 
   // The ABC Track user (keyed by email) carries one device count; compare it to
   // the SUM of every FreshBooks client's billed quantity.
-  if (billing.qty === row.devices_count) {
+  if (freshbooksQty === row.devices_count) {
     return { kind: 'none' };
   }
 
-  const byId = new Map(freshbooksClientIds.map((id, i) => [id, clients[i]!]));
+  // Representative invoice = most recent across all matched clients.
+  const latest = perClient
+    .filter((p) => p.invoiceDate)
+    .sort((a, b) => Date.parse(b.invoiceDate!) - Date.parse(a.invoiceDate!))[0];
+
   return {
     kind: 'mismatch',
     data: {
       abctrackId: row.id,
-      freshbooksClientId: freshbooksClientIds.join(', '),
-      freshbooksClientIds,
+      freshbooksClientId: perClient.map((p) => p.freshbooksClientId).join(', '),
+      freshbooksClientIds: perClient.map((p) => p.freshbooksClientId),
       email: row.email,
       name: clients.map(freshbooksName).filter(Boolean).join(' / ') || null,
       abctrackDevices: row.devices_count,
-      freshbooksQty: billing.qty,
-      hasInvoices: billing.hasInvoices,
-      invoiceNumber: billing.invoiceNumber,
-      invoiceDate: billing.invoiceDate,
-      breakdown: billing.perClient.map((p) => ({
+      freshbooksQty,
+      hasInvoices,
+      invoiceNumber: latest?.invoiceNumber ?? null,
+      invoiceDate: latest?.invoiceDate ?? null,
+      breakdown: perClient.map((p) => ({
         freshbooksClientId: p.freshbooksClientId,
-        name: freshbooksName(byId.get(p.freshbooksClientId) ?? {}),
+        name: p.name,
         qty: p.qty,
         invoiceNumber: p.invoiceNumber,
         invoiceDate: p.invoiceDate,
@@ -216,9 +248,51 @@ async function runSweep(): Promise<void> {
   snapshot = { ...snapshot, status: 'running', startedAt, error: null };
   logger.info({ startedAt }, 'reconcile.start');
 
+  // Baseline the cumulative FreshBooks counters so we can report this sweep's
+  // own request/rate-limit totals as a delta.
+  const fbBase = { ...freshbooksService.getRequestStats() };
+
   try {
     const rows = await abctrackService.listAllClients();
     const active = rows.filter((r) => r.active === 1 && r.email);
+
+    // ── Prefetch the entire FreshBooks side ONCE (paginated) ─────────────
+    // This replaces the previous two-calls-per-client pattern (one client
+    // search + one invoice fetch per ABC Track row) that fanned out into
+    // ~2×N requests and tripped the rate limit. We now make only a handful
+    // of paginated calls total, then classify every row against in-memory
+    // maps with zero further FreshBooks calls.
+    const fbClients = await freshbooksService.listAllClients();
+    const clientsByEmail = new Map<string, Record<string, unknown>[]>();
+    for (const c of fbClients) {
+      const email = String(c.email ?? '').trim().toLowerCase();
+      if (!email) continue;
+      const list = clientsByEmail.get(email);
+      if (list) list.push(c);
+      else clientsByEmail.set(email, [c]);
+    }
+
+    const fbInvoices = await freshbooksService.listAllInvoices({
+      sinceDays: env.FRESHBOOKS_INVOICE_LOOKBACK_DAYS,
+    });
+    const invoicesByCustomer = new Map<string, Record<string, unknown>[]>();
+    for (const inv of fbInvoices) {
+      const cid = invoiceCustomerId(inv);
+      if (!cid) continue;
+      const list = invoicesByCustomer.get(cid);
+      if (list) list.push(inv);
+      else invoicesByCustomer.set(cid, [inv]);
+    }
+
+    const ctx: SweepContext = { clientsByEmail, invoicesByCustomer };
+    logger.info(
+      {
+        fbClients: fbClients.length,
+        fbInvoices: fbInvoices.length,
+        invoiceLookbackDays: env.FRESHBOOKS_INVOICE_LOOKBACK_DAYS,
+      },
+      'reconcile.prefetched',
+    );
 
     const missing: MissingClient[] = [];
     const mismatch: VehicleMismatch[] = [];
@@ -226,7 +300,7 @@ async function runSweep(): Promise<void> {
 
     await mapLimit(active, env.RECONCILE_CONCURRENCY, async (row) => {
       try {
-        const result = await classify(row);
+        const result = await classify(row, ctx);
         if (result.kind === 'missing') missing.push(result.data);
         else if (result.kind === 'mismatch') mismatch.push(result.data);
       } catch (err) {
@@ -245,6 +319,14 @@ async function runSweep(): Promise<void> {
       mismatch: mismatch.length,
       errors: rowErrors.length,
     };
+    // FreshBooks request accounting for the whole sweep — total requests,
+    // how many were rate-limited (429), and any that exhausted retries.
+    const fbNow = freshbooksService.getRequestStats();
+    const fb = {
+      requests: fbNow.requests - fbBase.requests,
+      rateLimitHits: fbNow.rateLimitHits - fbBase.rateLimitHits,
+      retriesExhausted: fbNow.retriesExhausted - fbBase.retriesExhausted,
+    };
     snapshot = {
       status: 'ready',
       generatedAt: new Date().toISOString(),
@@ -256,7 +338,16 @@ async function runSweep(): Promise<void> {
       vehicleMismatch: mismatch,
       rowErrors,
     };
-    logger.info({ ...stats, durationMs: snapshot.durationMs }, 'reconcile.done');
+    logger.info(
+      {
+        ...stats,
+        durationMs: snapshot.durationMs,
+        freshbooksRequests: fb.requests,
+        rateLimitHits: fb.rateLimitHits,
+        retriesExhausted: fb.retriesExhausted,
+      },
+      'reconcile.done',
+    );
   } catch (err) {
     snapshot = {
       ...snapshot,

@@ -3,8 +3,10 @@ import { env } from '../config/env';
 import { logger } from '../utils/logger';
 import {
   createHttpClient,
+  getHttpStats,
   PermanentHttpError,
   TransientHttpError,
+  type HttpStats,
 } from '../utils/http';
 import { toMoney } from '../utils/decimal';
 import type { FreshbooksInvoice } from '../types';
@@ -72,7 +74,16 @@ export class FreshBooksService {
       onUnauthorized: async () => {
         await refreshFreshbooksToken();
       },
+      // Proactively stay under FreshBooks' rate limit, and transparently
+      // retry the 429s that still slip through (honouring Retry-After).
+      rateLimitPerSec: env.FRESHBOOKS_RATE_LIMIT_RPS,
+      maxRetries: env.FRESHBOOKS_MAX_RETRIES,
     });
+  }
+
+  /** Live request stats (total requests, rate-limit hits) for run summaries. */
+  getRequestStats(): HttpStats {
+    return getHttpStats(this.http);
   }
 
   /**
@@ -360,37 +371,103 @@ export class FreshBooksService {
     }
     const result = res.data?.response?.result ?? res.data?.response ?? res.data;
     const invoices = (result?.invoices ?? []) as Record<string, unknown>[];
-    // Drop soft-deleted invoices (vis_state === 1) before picking the latest.
-    const live = invoices.filter((i) => Number(i.vis_state ?? 0) !== 1);
-    if (live.length === 0) {
-      return {
-        qty: 0,
-        hasInvoices: false,
-        invoiceId: null,
-        invoiceNumber: null,
-        invoiceDate: null,
-      };
-    }
-    live.sort((a, b) => invoiceTime(b) - invoiceTime(a));
-    const latest = live[0]!; // guaranteed: we returned above when live is empty
-    const target = env.RECONCILE_DEVICE_LINE_NAME.trim().toLowerCase();
-    const lines = (latest.lines ?? []) as Record<string, unknown>[];
-    let qty = 0;
-    for (const ln of lines) {
-      if (String(ln.name ?? '').trim().toLowerCase() === target) {
-        const n = Number(ln.qty ?? 0);
-        if (Number.isFinite(n)) qty += n;
+    return deviceBillingFromInvoiceRows(invoices);
+  }
+
+  /**
+   * Fetch EVERY client on the account, paginating through all pages. Returns
+   * the raw client records (non-deleted). Used by the reconciliation sweep to
+   * build an email→client map in one bulk pass instead of one
+   * `/users/clients?search[email]=` call per ABC Track client (which was the
+   * call that tripped the rate limit).
+   */
+  async listAllClients(): Promise<Record<string, unknown>[]> {
+    const url = `/accounting/account/${this.accountId}/users/clients`;
+    const perPage = env.FRESHBOOKS_PAGE_SIZE;
+    const maxPages = 500;
+    const all: Record<string, unknown>[] = [];
+    let page = 1;
+
+    while (page <= maxPages) {
+      let res;
+      try {
+        res = await this.http.get(url, { params: { per_page: perPage, page } });
+      } catch (err) {
+        throw rewriteAuthError(err);
       }
+      const result = res.data?.response?.result ?? res.data?.response ?? res.data;
+      const clients = (result?.clients ?? []) as Record<string, unknown>[];
+      const totalPages = Number(result?.pages ?? 1);
+      for (const c of clients) {
+        if (Number(c.vis_state ?? 0) !== 1) all.push(c);
+      }
+      logger.info(
+        { page, totalPages, pageCount: clients.length, accumulated: all.length },
+        'freshbooks.clients.page',
+      );
+      if (page >= totalPages || clients.length === 0) break;
+      page += 1;
     }
-    return {
-      qty,
-      hasInvoices: true,
-      invoiceId: String(latest.id ?? latest.invoiceid ?? ''),
-      invoiceNumber: (latest.invoice_number ?? null) as string | null,
-      invoiceDate: (latest.create_date ?? latest.created_at ?? latest.date ?? null) as
-        | string
-        | null,
+
+    logger.info({ count: all.length }, 'freshbooks.clients.fetched_all');
+    return all;
+  }
+
+  /**
+   * Fetch invoices across the WHOLE account, paginating through all pages.
+   * Optionally limited to invoices created within `sinceDays` (0/undefined =
+   * all). Returns raw rows with line items included so the caller can compute
+   * each client's latest-invoice device quantity without a per-client call.
+   */
+  async listAllInvoices(opts?: { sinceDays?: number }): Promise<Record<string, unknown>[]> {
+    const url = `/accounting/account/${this.accountId}/invoices/invoices`;
+    const perPage = env.FRESHBOOKS_PAGE_SIZE;
+    const maxPages = 1000;
+    const all: Record<string, unknown>[] = [];
+    let page = 1;
+
+    const params: Record<string, unknown> = {
+      per_page: perPage,
+      // Array form is mandatory; `include=lines` is silently ignored.
+      include: ['lines'],
     };
+    if (opts?.sinceDays && opts.sinceDays > 0) {
+      const since = new Date(Date.now() - opts.sinceDays * 24 * 60 * 60 * 1000);
+      params['search[date_min]'] = since.toISOString().slice(0, 10);
+    }
+
+    while (page <= maxPages) {
+      let res;
+      try {
+        res = await this.http.get(url, { params: { ...params, page } });
+      } catch (err) {
+        throw rewriteAuthError(err);
+      }
+      const result = res.data?.response?.result ?? res.data?.response ?? res.data;
+      const invoices = (result?.invoices ?? []) as Record<string, unknown>[];
+      const totalPages = Number(result?.pages ?? 1);
+      for (const inv of invoices) {
+        if (Number(inv.vis_state ?? 0) !== 1) all.push(inv);
+      }
+      logger.info(
+        { page, totalPages, pageCount: invoices.length, accumulated: all.length },
+        'freshbooks.invoices.page',
+      );
+      if (page >= totalPages || invoices.length === 0) break;
+      page += 1;
+    }
+
+    logger.info({ count: all.length }, 'freshbooks.invoices.fetched_all');
+    return all;
+  }
+
+  /**
+   * Compute device billing from a set of raw invoice rows already in hand
+   * (e.g. grouped out of `listAllInvoices`). Same latest-invoice logic as
+   * `getDeviceBillingForClient`, minus the network call.
+   */
+  deviceBillingFromRows(rows: Record<string, unknown>[]): DeviceBilling {
+    return deviceBillingFromInvoiceRows(rows);
   }
 
   /**
@@ -508,6 +585,57 @@ function invoiceTime(i: Record<string, unknown>): number {
   const s = (i.create_date ?? i.created_at ?? i.date) as string | undefined;
   const t = s ? Date.parse(s) : NaN;
   return Number.isNaN(t) ? 0 : t;
+}
+
+export interface DeviceBilling {
+  qty: number;
+  hasInvoices: boolean;
+  invoiceId: string | null;
+  invoiceNumber: string | null;
+  invoiceDate: string | null;
+}
+
+/**
+ * Given the raw invoice rows for ONE client, find the latest non-deleted
+ * invoice and sum the qty of every line named `RECONCILE_DEVICE_LINE_NAME`.
+ * Pure (no network) so it can run over both a single-client fetch and rows
+ * grouped out of a bulk account-wide fetch.
+ */
+function deviceBillingFromInvoiceRows(rows: Record<string, unknown>[]): DeviceBilling {
+  const live = rows.filter((i) => Number(i.vis_state ?? 0) !== 1);
+  if (live.length === 0) {
+    return { qty: 0, hasInvoices: false, invoiceId: null, invoiceNumber: null, invoiceDate: null };
+  }
+  live.sort((a, b) => invoiceTime(b) - invoiceTime(a));
+  const latest = live[0]!;
+  const target = env.RECONCILE_DEVICE_LINE_NAME.trim().toLowerCase();
+  const lines = (latest.lines ?? []) as Record<string, unknown>[];
+  let qty = 0;
+  for (const ln of lines) {
+    if (String(ln.name ?? '').trim().toLowerCase() === target) {
+      const n = Number(ln.qty ?? 0);
+      if (Number.isFinite(n)) qty += n;
+    }
+  }
+  return {
+    qty,
+    hasInvoices: true,
+    invoiceId: String(latest.id ?? latest.invoiceid ?? ''),
+    invoiceNumber: (latest.invoice_number ?? null) as string | null,
+    invoiceDate: (latest.create_date ?? latest.created_at ?? latest.date ?? null) as
+      | string
+      | null,
+  };
+}
+
+/** Extract the customer id off a raw invoice row, trying the known field names. */
+export function invoiceCustomerId(inv: Record<string, unknown>): string | null {
+  const id =
+    (inv.customerid as string | number | undefined) ??
+    (inv.userid as string | number | undefined) ??
+    (inv.clientid as string | number | undefined) ??
+    (inv.client_id as string | number | undefined);
+  return id === undefined || id === null ? null : String(id);
 }
 
 // Singleton — one HTTP client across the process is intentional.

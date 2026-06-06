@@ -125,6 +125,25 @@ const schema = z.object({
     .default('https://api.freshbooks.com/auth/oauth/token'),
   FRESHBOOKS_WEBHOOK_SECRET: webhookSecret,
 
+  // ── FreshBooks rate-limit / pagination tuning ────────────────────────
+  // Proactive client-side throttle: the max number of outbound FreshBooks
+  // requests we start per second. Kept below FreshBooks' server limit so a
+  // bulk sweep never trips 429 in the first place. The HTTP client spaces
+  // requests by 1000/rps ms.
+  FRESHBOOKS_RATE_LIMIT_RPS: z.coerce.number().positive().max(50).default(5),
+  // How many times to retry a 429/5xx/network failure before giving up.
+  // Backoff honours the server's Retry-After header when present, else uses
+  // exponential backoff with jitter.
+  FRESHBOOKS_MAX_RETRIES: z.coerce.number().int().min(0).max(10).default(5),
+  // Page size for paginated list endpoints (clients, invoices). 100 is the
+  // FreshBooks maximum and minimises the number of round-trips.
+  FRESHBOOKS_PAGE_SIZE: z.coerce.number().int().positive().max(100).default(100),
+  // When the reconciliation sweep bulk-fetches invoices, only pull invoices
+  // created within this many days. Device quantity comes from each client's
+  // LATEST invoice, and active clients are billed monthly, so a few months is
+  // ample — this keeps the bulk fetch small. Set 0 to fetch all invoices.
+  FRESHBOOKS_INVOICE_LOOKBACK_DAYS: z.coerce.number().int().min(0).default(180),
+
   // ABC Track (live.abctrack.net) — Laravel-session-authenticated admin UI
   // backend. Email + password are required (the session layer logs in
   // lazily); the rest default to the paths/timeouts the live deployment
