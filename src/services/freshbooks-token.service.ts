@@ -126,9 +126,32 @@ export async function getAccessToken(): Promise<string> {
   if (cache && Date.now() - cache.cachedAt < CACHE_TTL_MS) {
     return cache.accessToken;
   }
-  const row = await prisma.oauthToken.findUnique({
-    where: { provider: PROVIDER },
-  });
+
+  let row;
+  try {
+    row = await prisma.oauthToken.findUnique({
+      where: { provider: PROVIDER },
+    });
+  } catch (err) {
+    // The DB read is only here to pick up cross-node rotations — the access
+    // token we already hold is valid for far longer than the 30s TTL. A
+    // transient DB outage (e.g. Render dropping the connection mid-sweep)
+    // must NOT fail every outbound FreshBooks call. Serve the cached token
+    // and push the next DB re-read out by one TTL window so we don't hammer
+    // an unreachable DB on every request. If our token has genuinely been
+    // rotated away, the call will 401 and the refresh path takes over.
+    if (cache) {
+      cache.cachedAt = Date.now();
+      logger.warn(
+        { err: (err as Error).message },
+        'freshbooks.token.read.degraded_serving_cache',
+      );
+      return cache.accessToken;
+    }
+    // No cache at all (cold start with the DB down) — nothing we can do.
+    throw err;
+  }
+
   if (!row) {
     throw new Error(
       'oauth_tokens row missing for "freshbooks" — call loadTokens() at boot',
