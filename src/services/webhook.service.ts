@@ -11,7 +11,6 @@ import { decideAccess } from './balance.engine';
 import { enqueueRetry } from './retry.service';
 import { TransientHttpError } from '../utils/http';
 import { toMoney } from '../utils/decimal';
-import { nextMonthTenthAtEightUtc } from '../utils/expiration';
 
 /**
  * Recompute Client.lastPaymentAt from the PaymentLog table. Called after
@@ -21,15 +20,76 @@ import { nextMonthTenthAtEightUtc } from '../utils/expiration';
  * subquery for every read.
  */
 async function refreshLastPaymentAt(clientId: string): Promise<void> {
+  // Access is driven by effectivePaidAt (back-dating adjusted), not the raw
+  // audit paidAt. Fall back to paidAt for any legacy row that predates the
+  // effectivePaidAt column being populated.
   const latest = await prisma.paymentLog.findFirst({
-    where: { clientId, paidAt: { not: null } },
-    orderBy: { paidAt: 'desc' },
-    select: { paidAt: true },
+    where: { clientId, effectivePaidAt: { not: null } },
+    orderBy: { effectivePaidAt: 'desc' },
+    select: { effectivePaidAt: true },
   });
   await prisma.client.update({
     where: { id: clientId },
-    data: { lastPaymentAt: latest?.paidAt ?? null },
+    data: { lastPaymentAt: latest?.effectivePaidAt ?? null },
   });
+}
+
+/**
+ * Pure core of the back-dating adjustment: the later of the payment date and
+ * the settled invoice's date. Kept separate from the I/O wrapper so the rule
+ * is unit-testable. Never reduces the date — a payment can only ever count
+ * from a LATER period, never an earlier one.
+ *
+ *   paidAt=null                      → null
+ *   invoiceDate=null                 → paidAt   (today's behaviour)
+ *   invoiceDate later than paidAt    → invoiceDate  (back-dating case)
+ *   invoiceDate same/earlier         → paidAt
+ */
+export function effectivePaidDate(
+  paidAt: Date | null,
+  invoiceDate: Date | null,
+): Date | null {
+  if (!paidAt) return null;
+  if (!invoiceDate) return paidAt;
+  return invoiceDate.getTime() > paidAt.getTime() ? invoiceDate : paidAt;
+}
+
+/**
+ * Compute the access-relevant date for a payment: the later of the payment's
+ * own date and the date of the invoice it settles. A payment back-dated into
+ * a prior month that pays a current-month invoice should count from the
+ * invoice's month (the period the money is actually for).
+ *
+ * Returns null only when there is no paid date at all. When the invoice date
+ * can't be resolved, degrades to the payment date (today's behaviour).
+ */
+export async function computeEffectivePaidAt(args: {
+  paidAt: Date | null;
+  invoiceId: string | null;
+}): Promise<Date | null> {
+  if (!args.paidAt) return null;
+  if (!args.invoiceId) return args.paidAt;
+
+  // Prefer the locally cached invoice date; only hit FreshBooks if we don't
+  // have it, to keep the hot webhook path cheap.
+  let invoiceDate: Date | null = null;
+  const cached = await prisma.invoiceCache.findFirst({
+    where: { freshbooksInvoiceId: args.invoiceId },
+    select: { issuedDate: true },
+  });
+  invoiceDate = cached?.issuedDate ?? null;
+  if (!invoiceDate) {
+    try {
+      invoiceDate = await freshbooksService.getInvoiceIssuedDate(args.invoiceId);
+    } catch (e) {
+      logger.warn(
+        { err: (e as Error).message, invoiceId: args.invoiceId },
+        'effective-paid-at.invoice-date.fetch-failed',
+      );
+    }
+  }
+
+  return effectivePaidDate(args.paidAt, invoiceDate);
 }
 
 /**
@@ -488,17 +548,10 @@ export async function processWebhookEvent(webhookEventId: string): Promise<void>
         );
       }
     } else if (autoCreated) {
-      // Newly auto-created ABC Track user (from a client.create) already
-      // has the full profile + initial expiration set by createUser. Just
-      // log the decision; do not re-evaluate.
-      await prisma.actionLog.create({
-        data: {
-          clientId: client.id,
-          kind: 'DECISION_RESTORE',
-          message: `New client — access granted until ${nextMonthTenthAtEightUtc(new Date()).toISOString().slice(0, 10)}.`,
-          details: { effectiveAccessExpiresAt: client.accessExpiresAt?.toISOString() ?? null },
-        },
-      });
+      // Newly auto-created ABC Track user (from a client.create) already had
+      // its full profile + payment-driven expiration set by
+      // tryAutoMapGpswoxUser, which also logged the actual DECISION_RESTORE /
+      // DECISION_BLOCK. Nothing more to do here — do NOT re-grant access.
     }
     // client.update / client.create for already-mapped clients / any other
     // event type: no-op. No ABC Track write, no access re-evaluation.
@@ -551,7 +604,9 @@ async function recordPaymentLog(
     (obj.date as string | undefined) ??
     (obj.paid_date as string | undefined) ??
     (payload.date as string | undefined);
-  const paidAt = paidAtRaw ? new Date(paidAtRaw) : null;
+  const paidAtParsed = paidAtRaw ? new Date(paidAtRaw) : null;
+  const paidAt =
+    paidAtParsed && !isNaN(paidAtParsed.getTime()) ? paidAtParsed : null;
   const freshbooksPaymentId =
     (obj.id as string | number | undefined)?.toString() ??
     (payload.object_id as string | undefined) ??
@@ -561,6 +616,10 @@ async function recordPaymentLog(
     (obj.invoice_id as string | undefined) ??
     null;
 
+  // Back-dating adjustment: the later of the payment date and the settled
+  // invoice's date. This is what drives access (via lastPaymentAt).
+  const effectivePaidAt = await computeEffectivePaidAt({ paidAt, invoiceId });
+
   await prisma.paymentLog.create({
     data: {
       clientId,
@@ -568,7 +627,8 @@ async function recordPaymentLog(
       invoiceId,
       amount: amount.toFixed(2),
       currency,
-      paidAt: paidAt && !isNaN(paidAt.getTime()) ? paidAt : null,
+      paidAt,
+      effectivePaidAt,
       source: 'webhook',
       rawPayload: payload as Prisma.InputJsonValue,
     },
@@ -694,7 +754,19 @@ async function tryAutoMapGpswoxUser(
       .filter((v) => typeof v === 'string' && v.length > 0)
       .join('\n');
 
-    const expiration = nextMonthTenthAtEightUtc(new Date());
+    // Seed the new ABC Track user's expiration from the ACTUAL access
+    // decision — never grant a free month to a client with no qualifying
+    // payment. A client with no/stale payment is created with NO expiration
+    // (enable_expiration_date=0 via accessExpiresAt=null) and left BLOCKED
+    // locally; ABC Track shows them but their access is not extended.
+    const decision = decideAccess({
+      isUnlimited: client.isUnlimited,
+      latestPaymentAt: client.lastPaymentAt,
+      now: new Date(),
+    });
+    const expiration = decision.shouldRestore
+      ? decision.effectiveAccessExpiresAt
+      : null;
     const newGpswoxUserId = await abctrackService.createUser({
       clientId: client.id,
       email: client.email,
@@ -710,7 +782,7 @@ async function tryAutoMapGpswoxUser(
       where: { id: client.id },
       data: {
         gpswoxUserId: String(newGpswoxUserId),
-        status: 'ACTIVE',
+        status: decision.shouldRestore ? 'ACTIVE' : 'BLOCKED',
         accessExpiresAt: expiration,
         lastSyncedAt: new Date(),
       },
@@ -721,6 +793,17 @@ async function tryAutoMapGpswoxUser(
         kind: 'GPSWOX_MATCHED',
         message: `Auto-created ABC Track user id=${newGpswoxUserId} from FreshBooks profile.`,
         details: { gpswoxUserId: newGpswoxUserId, email: client.email },
+      },
+    });
+    await prisma.actionLog.create({
+      data: {
+        clientId: client.id,
+        kind: decision.shouldRestore ? 'DECISION_RESTORE' : 'DECISION_BLOCK',
+        message: `New client (auto-created): ${decision.reason}`,
+        details: {
+          latestPaymentAt: decision.latestPaymentAt?.toISOString() ?? null,
+          effectiveAccessExpiresAt: expiration?.toISOString() ?? null,
+        },
       },
     });
     return { client: updated, autoCreated: true };

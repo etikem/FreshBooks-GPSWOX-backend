@@ -129,6 +129,32 @@ export class FreshBooksService {
   }
 
   /**
+   * Fetch the issued date of a single invoice. Used to compute a payment's
+   * `effectivePaidAt` — a back-dated payment that settles a later-period
+   * invoice should count from the invoice's month, not the payment's.
+   *
+   * Prefers `create_date` (the invoice's business date, e.g. "2026-07-01"),
+   * falling back to `generation_date` / `date`. Returns null on 404 or when
+   * no parseable date is present, so callers degrade to the payment date.
+   */
+  async getInvoiceIssuedDate(invoiceId: string): Promise<Date | null> {
+    const url = `/accounting/account/${this.accountId}/invoices/invoices/${invoiceId}`;
+    try {
+      const res = await this.http.get(url);
+      const result = res.data?.response?.result ?? res.data?.response ?? res.data;
+      const invoice = result?.invoice as Record<string, unknown> | undefined;
+      if (!invoice) return null;
+      return parseDate(
+        invoice.create_date ?? invoice.generation_date ?? invoice.date,
+      );
+    } catch (err) {
+      const status = (err as { status?: number }).status;
+      if (status === 404) return null;
+      throw rewriteAuthError(err);
+    }
+  }
+
+  /**
    * Fetch a single payment. Same form-encoded problem as invoices: the
    * webhook only carries the payment id, so we have to GET the payment to
    * find out which client it belongs to AND to record the real amount/date

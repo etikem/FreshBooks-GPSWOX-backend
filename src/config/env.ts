@@ -198,6 +198,15 @@ const schema = z.object({
     .transform((v) => v === 'true' || v === '1')
     .default('true'),
   CRON_SWEEP_INTERVAL_MS: z.coerce.number().int().positive().default(60 * 60 * 1000),
+  // Run the access-expiry cron sweep from the API process too, not only the
+  // retry worker. Defaults ON so a web-only deployment (no separate worker
+  // dyno) still blocks clients whose access window elapsed. Safe to leave on
+  // even when the worker runs — the sweep is idempotent. Set to "false" only
+  // if you run a dedicated worker and want to avoid the redundant timer.
+  CRON_SWEEP_IN_API: z
+    .union([z.literal('true'), z.literal('false'), z.literal('1'), z.literal('0')])
+    .transform((v) => v === 'true' || v === '1')
+    .default('true'),
 
   // ── Reconciliation sweep (ABC Track ↔ FreshBooks discrepancy report) ──
   // Name of the FreshBooks invoice line item that carries the per-device

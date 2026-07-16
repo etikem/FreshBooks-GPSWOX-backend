@@ -80,8 +80,9 @@ model Client {
   // payment state.
   isUnlimited         Boolean      @default(false)
   // Wall-clock of the most recent successful payment we've observed. Mirror
-  // of MAX(PaymentLog.paidAt). Drives the access decision.
-  lastPaymentAt       DateTime?
+  // of MAX(PaymentLog.effectivePaidAt) — i.e. back-dating-adjusted. Drives
+  // the access decision.
+  lastPaymentAt       DateTime? @db.Timestamptz(3)
 
   status              ClientStatus @default(UNKNOWN)
   // Legacy — populated by the old invoice-driven engine. No longer written.
@@ -183,13 +184,20 @@ model PaymentLog {
   invoiceId            String?
   amount               Decimal  @db.Decimal(14, 2)
   currency             String
-  paidAt               DateTime?
+  // True payment date from FreshBooks (payment.date) — preserved for audit.
+  paidAt               DateTime? @db.Timestamptz(3)
+  // Access-relevant date: MAX(paidAt, linked invoice date). Handles back-dated
+  // payments that settle a later-period invoice. This — not paidAt — is what
+  // drives Client.lastPaymentAt and the access engine. See the effective-paid-at
+  // migration for the rationale.
+  effectivePaidAt      DateTime? @db.Timestamptz(3)
   source               String   // "webhook" | "manual" | "sync"
   rawPayload           Json?
 
   createdAt            DateTime @default(now())
 
   @@index([clientId, paidAt])
+  @@index([clientId, effectivePaidAt])
   @@map("payment_logs")
 }
 

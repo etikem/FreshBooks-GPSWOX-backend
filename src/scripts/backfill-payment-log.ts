@@ -20,6 +20,23 @@ import { prisma } from '../db/prisma';
 import { logger } from '../utils/logger';
 import { freshbooksService } from '../services/freshbooks.service';
 import { loadTokens as loadFreshbooksTokens } from '../services/freshbooks-token.service';
+import { computeEffectivePaidAt } from '../services/webhook.service';
+
+/**
+ * Mirror MAX(effectivePaidAt) — the back-dating-adjusted date — onto
+ * Client.lastPaymentAt, which the access engine reads.
+ */
+async function recomputeLastPaymentAt(clientId: string): Promise<void> {
+  const latest = await prisma.paymentLog.findFirst({
+    where: { clientId, effectivePaidAt: { not: null } },
+    orderBy: { effectivePaidAt: 'desc' },
+    select: { effectivePaidAt: true },
+  });
+  await prisma.client.update({
+    where: { id: clientId },
+    data: { lastPaymentAt: latest?.effectivePaidAt ?? null },
+  });
+}
 
 async function main(): Promise<void> {
   await loadFreshbooksTokens();
@@ -45,15 +62,7 @@ async function main(): Promise<void> {
       if (payments.length === 0) {
         // Still recompute lastPaymentAt — covers the case where every
         // payment was deleted in FreshBooks since the last sync.
-        const latest = await prisma.paymentLog.findFirst({
-          where: { clientId: c.id, paidAt: { not: null } },
-          orderBy: { paidAt: 'desc' },
-          select: { paidAt: true },
-        });
-        await prisma.client.update({
-          where: { id: c.id },
-          data: { lastPaymentAt: latest?.paidAt ?? null },
-        });
+        await recomputeLastPaymentAt(c.id);
         touchedClients += 1;
         continue;
       }
@@ -67,6 +76,10 @@ async function main(): Promise<void> {
           skipped += 1;
           continue;
         }
+        const effectivePaidAt = await computeEffectivePaidAt({
+          paidAt: p.paidAt,
+          invoiceId: p.invoiceId,
+        });
         await prisma.paymentLog.create({
           data: {
             clientId: c.id,
@@ -75,6 +88,7 @@ async function main(): Promise<void> {
             amount: p.amount?.toFixed(2) ?? '0.00',
             currency: p.currency,
             paidAt: p.paidAt,
+            effectivePaidAt,
             source: 'backfill',
             rawPayload: p.raw as object,
           },
@@ -82,15 +96,7 @@ async function main(): Promise<void> {
         inserted += 1;
       }
 
-      const latest = await prisma.paymentLog.findFirst({
-        where: { clientId: c.id, paidAt: { not: null } },
-        orderBy: { paidAt: 'desc' },
-        select: { paidAt: true },
-      });
-      await prisma.client.update({
-        where: { id: c.id },
-        data: { lastPaymentAt: latest?.paidAt ?? null },
-      });
+      await recomputeLastPaymentAt(c.id);
       touchedClients += 1;
     } catch (err) {
       failed += 1;

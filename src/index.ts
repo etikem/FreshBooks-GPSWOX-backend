@@ -7,6 +7,7 @@ import { adminRouter } from './routes/admin.routes';
 import { errorHandler } from './middleware/error-handler';
 import { checkFreshbooksTokenAtStartup } from './utils/freshbooks-token';
 import { catchUpUnprocessedEvents } from './services/webhook.service';
+import { runCronSweepOnce } from './services/cron-sweep.service';
 import {
   loadTokens as loadFreshbooksTokens,
   getAccessToken as getFreshbooksAccessToken,
@@ -105,6 +106,32 @@ async function bootstrap(): Promise<void> {
     if (env.CATCHUP_SWEEP_ON_BOOT) {
       catchUpUnprocessedEvents().catch((err) =>
         logger.warn({ err: (err as Error).message }, 'webhook.catchup.fatal'),
+      );
+    }
+
+    // Access-expiry cron sweep, run from the API process. In a web-only
+    // deployment (no separate worker) this is the ONLY thing that blocks
+    // clients whose access window elapsed. Runs once shortly after boot,
+    // then on CRON_SWEEP_INTERVAL_MS. Idempotent and local-only, so it's
+    // safe even if a worker is also sweeping. Guarded so it can be disabled
+    // when a dedicated worker owns the sweep.
+    if (env.CRON_SWEEP_IN_API) {
+      const runSweep = () =>
+        runCronSweepOnce()
+          .then((r) => {
+            if (r.blocked > 0 || r.errors > 0) {
+              logger.info(r, 'cron.sweep.api.done');
+            }
+          })
+          .catch((err) =>
+            logger.warn({ err: (err as Error).message }, 'cron.sweep.api.failed'),
+          );
+      // Kick once after a short delay so boot isn't blocked, then interval.
+      setTimeout(runSweep, 30_000).unref?.();
+      setInterval(runSweep, env.CRON_SWEEP_INTERVAL_MS).unref?.();
+      logger.info(
+        { intervalMs: env.CRON_SWEEP_INTERVAL_MS },
+        'cron.sweep.api.scheduled',
       );
     }
   });
